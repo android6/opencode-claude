@@ -16,7 +16,7 @@
  * manager owns the install), so the outcome is read from its output.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
@@ -112,16 +112,24 @@ export function readCliUpdateRecord(
   return null;
 }
 
-function writeCliUpdateRecord(record: ClaudeCliUpdateRecord, env: Env): void {
+/**
+ * Written whole or not at all: another server may read it at any moment,
+ * and a torn file would read as "never checked" and start one more update.
+ */
+function writeCliUpdateRecord(record: ClaudeCliUpdateRecord, env: Env): boolean {
   try {
     const file = cliUpdateRecordPath(env);
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(record, null, 2));
+    const partial = `${file}.${process.pid}.tmp`;
+    writeFileSync(partial, JSON.stringify(record, null, 2));
+    renameSync(partial, file);
+    return true;
   } catch (err) {
     log.warn(
       "[opencode-claude] could not record the CLI update outcome",
       err instanceof Error ? err.message : err,
     );
+    return false;
   }
 }
 
@@ -152,6 +160,12 @@ export function parseClaudeUpdateOutput(
 }
 
 let updating = false;
+/**
+ * Epoch ms of the last attempt whose record could not be written (read-only
+ * data dir, full disk). Without it every plugin instance loaded after such
+ * an attempt would find no record and run the update again.
+ */
+let unrecordedAttemptAt = 0;
 
 export function isClaudeCliUpdateRunning(): boolean {
   return updating;
@@ -249,7 +263,8 @@ function logOutcome(outcome: ClaudeCliUpdateOutcome): void {
  * shared: whichever instance finds the interval elapsed runs the update, the
  * others read the fresh record and skip. The first check runs right away, so
  * a server that was idle for days catches up as soon as a plugin loads.
- * Models of a new version reach OpenCode with the next catalog refresh.
+ * Models of a new version reach OpenCode the next time it loads the plugin,
+ * which is when the catalog is read.
  */
 export function startClaudeCliAutoUpdate(params: {
   options?: { cliAutoUpdate?: unknown };
@@ -276,12 +291,20 @@ export function startClaudeCliAutoUpdate(params: {
     // No CLI yet (the install action may add one later): wait for the
     // next tick without recording anything.
     if (!(await cliPresent())) return;
-    if (stopped) return;
+    // Instances of one process share the CLI probe above and resume
+    // together; the one that already started the update must not be
+    // counted as "another Claude process" by the others.
+    if (stopped || updating) return;
     const record = readCliUpdateRecord(env);
     const now = Date.now();
+    // An unreadable `at` (a hand-edited file) compares as NaN and falls
+    // through to one extra run, the safe side; not guarded further.
     if (record && now - Date.parse(record.at) < intervalMs) return;
+    if (!record && now - unrecordedAttemptAt < intervalMs) return;
     const outcome = await update();
-    writeCliUpdateRecord({ at: new Date(now).toISOString(), outcome }, env);
+    if (!writeCliUpdateRecord({ at: new Date(now).toISOString(), outcome }, env)) {
+      unrecordedAttemptAt = now;
+    }
     logOutcome(outcome);
   };
 

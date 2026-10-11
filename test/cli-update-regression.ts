@@ -5,17 +5,19 @@
  *   a failure reports the CLI's last line, not its "Current version" preamble,
  *   and a successful update drops the memoized CLI path;
  * - the periodic check runs once per interval across plugin instances, through
- *   the shared record file, waits for a missing CLI, and is off under the
- *   documented switches.
+ *   the shared record file (and in memory when the file cannot be written),
+ *   waits for a missing CLI, and is off under the documented switches;
+ * - the run settles on `close`, so output after `exit` still counts, and on
+ *   `exit` alone when a child never closes.
  *
  * Fake CLI children only (no shell scripts), so the file runs on Windows too.
  *
  * Run: bun test/cli-update-regression.ts
  */
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { assert, sleep } from "./helpers.ts";
 
 async function main() {
@@ -69,7 +71,15 @@ async function main() {
     });
     return { child, streams };
   };
-  const run = async (lines: string, code: number, binaryPath = "/opt/claude") => {
+  // How the fake child ends: the usual order, output still arriving after
+  // `exit` (pipes drain late), or `exit` with no `close` at all.
+  type Ending = "normal" | "output-after-exit" | "exit-only";
+  const run = async (
+    lines: string,
+    code: number,
+    binaryPath = "/opt/claude",
+    ending: Ending = "normal",
+  ) => {
     const { child, streams } = fakeCli();
     const calls: string[][] = [];
     let resets = 0;
@@ -85,9 +95,16 @@ async function main() {
       },
     });
     await sleep(0);
-    streams.stdout.emit("data", lines);
-    child.emit("exit", code);
-    child.emit("close", code);
+    if (ending === "output-after-exit") {
+      child.emit("exit", code);
+      await sleep(30);
+      streams.stdout.emit("data", lines);
+      child.emit("close", code);
+    } else {
+      streams.stdout.emit("data", lines);
+      child.emit("exit", code);
+      if (ending === "normal") child.emit("close", code);
+    }
     return { outcome: await pending, calls, resets };
   };
   // The CLI's progress lines come before the verdict in every transcript.
@@ -125,6 +142,16 @@ async function main() {
     assert.deepEqual(viaNode.outcome, { kind: "up-to-date", version: "2.1.296" });
     assert.deepEqual(viaNode.calls, [["node", cliJs, "update"]]);
     assert.equal(viaNode.resets, 0);
+
+    // The verdict may arrive after `exit`: `close` is what settles the run.
+    const lateVerdict = await run(`${preamble}Successfully updated from 2.1.280 to version 2.1.296\n`, 0, "/opt/claude", "output-after-exit");
+    assert.deepEqual(lateVerdict.outcome, { kind: "updated", from: "2.1.280", to: "2.1.296" });
+
+    // A child that never emits `close` still settles, on `exit` after a grace period.
+    const started = Date.now();
+    const exitOnly = await run(`${preamble}Claude Code is up to date (2.1.296)\n`, 0, "/opt/claude", "exit-only");
+    assert.deepEqual(exitOnly.outcome, { kind: "up-to-date", version: "2.1.296" });
+    assert.ok(Date.now() - started >= 400, "exit-only settles after the grace period");
   }
 
   // Switches.
@@ -223,8 +250,50 @@ async function main() {
     stopOff();
     assert.equal(offRuns, 0);
     assert.equal(readCliUpdateRecord(env), null);
+
+    // The record cannot be written (data dir is a file): the attempt still
+    // counts within this process, so a second instance does not run again.
+    const blocker = join(data, "not-a-dir");
+    writeFileSync(blocker, "x");
+    const unwritable = { XDG_DATA_HOME: join(blocker, "share"), OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS: "200" };
+    let unrecordedRuns = 0;
+    const unrecordedUpdate = async () => {
+      unrecordedRuns += 1;
+      return { kind: "up-to-date" as const, version: "2.1.296" };
+    };
+    const stopU1 = startClaudeCliAutoUpdate({ env: unwritable, cliPresent, update: unrecordedUpdate });
+    await sleep(20);
+    assert.equal(unrecordedRuns, 1, "unwritable record: first instance runs");
+    assert.equal(readCliUpdateRecord(unwritable), null, "unwritable record: nothing on disk");
+    const stopU2 = startClaudeCliAutoUpdate({ env: unwritable, cliPresent, update: unrecordedUpdate });
+    await sleep(20);
+    assert.equal(unrecordedRuns, 1, "unwritable record: second instance skips within the interval");
+    stopU1();
+    stopU2();
   } finally {
     rmSync(data, { recursive: true, force: true });
+  }
+
+  // A memoized CLI path that vanished (another process updated the install)
+  // is re-probed instead of reused. Windows resolves by file presence alone,
+  // so a bare file stands in for the CLI; POSIX would probe it.
+  if (process.platform === "win32") {
+    const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import("../src/executable-path.ts");
+    const bin = mkdtempSync(join(tmpdir(), "opencode-claude-bin-"));
+    try {
+      const exe = join(bin, "claude.exe");
+      writeFileSync(exe, "");
+      const env = { PATH: bin, HOME: bin };
+      resetClaudeCliResolutionCache();
+      // The PATH walk joins with "/", so compare resolved paths.
+      assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
+      assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe, "memoized");
+      rmSync(exe);
+      assert.equal(await resolveClaudeCli(env), null, "vanished path is re-probed, not reused");
+    } finally {
+      resetClaudeCliResolutionCache();
+      rmSync(bin, { recursive: true, force: true });
+    }
   }
 
   console.log("ok — cli update regression passed");

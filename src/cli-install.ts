@@ -183,10 +183,12 @@ export function runInstaller(
     let output = "";
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let exitFallback: ReturnType<typeof setTimeout> | undefined;
     const finish = (result: ClaudeCliInstallResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(exitFallback);
       resolve(result);
     };
 
@@ -240,8 +242,8 @@ export function runInstaller(
     // close (test doubles).
     child.once("close", (code) => settle(code));
     child.once("exit", (code) => {
-      const late = setTimeout(() => settle(code), EXIT_WITHOUT_CLOSE_MS);
-      late.unref?.();
+      exitFallback = setTimeout(() => settle(code), EXIT_WITHOUT_CLOSE_MS);
+      exitFallback.unref?.();
     });
   });
 }
