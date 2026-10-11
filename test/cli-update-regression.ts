@@ -23,6 +23,7 @@ import { assert, sleep } from "./helpers.ts";
 async function main() {
   const {
     cliAutoUpdateDisabledReason,
+    cliUpdateLogPath,
     cliUpdateRecordPath,
     parseClaudeUpdateOutput,
     readCliUpdateRecord,
@@ -233,6 +234,10 @@ async function main() {
       from: "2.1.280",
       to: "2.1.296",
     });
+    // The history file keeps updates (and failures), not the hourly "up to date".
+    const history = readFileSync(cliUpdateLogPath(env), "utf8").trim().split("\n");
+    assert.equal(history.length, 1, `history has one line: ${history.join(" | ")}`);
+    assert.match(history[0]!, /^\d{4}-\d{2}-\d{2}T.*Z updated 2\.1\.280 -> 2\.1\.296$/);
 
     // Off by option: nothing runs, nothing is recorded.
     rmSync(cliUpdateRecordPath(env), { force: true });

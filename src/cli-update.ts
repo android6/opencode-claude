@@ -16,7 +16,13 @@
  * manager owns the install), so the outcome is read from its output.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
@@ -96,6 +102,35 @@ export function cliAutoUpdateDisabledReason(
 export function cliUpdateRecordPath(env: Env = process.env): string {
   const base = env.XDG_DATA_HOME || join(homedir(), ".local", "share");
   return join(base, "opencode-claude", "cli-update.json");
+}
+
+/** History next to the record: one line per update and per failure. */
+export function cliUpdateLogPath(env: Env = process.env): string {
+  return join(dirname(cliUpdateRecordPath(env)), "cli-update.log");
+}
+
+/**
+ * The record holds the last attempt only, and the plugin's info log is off
+ * unless debugging. Updates and failures are the events a user comes back
+ * for, so they are appended here as well; "up to date" every hour is not.
+ */
+function appendCliUpdateLog(record: ClaudeCliUpdateRecord, env: Env): void {
+  const { outcome } = record;
+  let line: string;
+  if (outcome.kind === "updated") {
+    line = `updated ${outcome.from} -> ${outcome.to}`;
+  } else if (outcome.kind === "failed") {
+    line = `failed: ${outcome.message}`;
+  } else {
+    return;
+  }
+  try {
+    const file = cliUpdateLogPath(env);
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${record.at} ${line}\n`);
+  } catch {
+    // the record and the plugin log still have it
+  }
 }
 
 export function readCliUpdateRecord(
@@ -302,9 +337,9 @@ export function startClaudeCliAutoUpdate(params: {
     if (record && now - Date.parse(record.at) < intervalMs) return;
     if (!record && now - unrecordedAttemptAt < intervalMs) return;
     const outcome = await update();
-    if (!writeCliUpdateRecord({ at: new Date(now).toISOString(), outcome }, env)) {
-      unrecordedAttemptAt = now;
-    }
+    const attempt = { at: new Date(now).toISOString(), outcome };
+    if (!writeCliUpdateRecord(attempt, env)) unrecordedAttemptAt = now;
+    appendCliUpdateLog(attempt, env);
     logOutcome(outcome);
   };
 
