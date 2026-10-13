@@ -15,6 +15,7 @@ import type { Model, Plugin, Provider } from "@opencode/plugin";
 import {
   DIRECTORY_HEADER,
   EFFORT_HEADER,
+  FORK_SOURCES_HEADER,
   KIND_HEADER,
   OPENAI_COMPATIBLE_PACKAGE,
   PROVIDER_ID,
@@ -55,6 +56,63 @@ export function applyClaudeRequestContextHeaders(
 ): void {
   headers[DIRECTORY_HEADER] = directory;
   if (sessionID) headers["x-opencode-claude-session"] = sessionID;
+}
+
+/**
+ * The session a forked OpenCode session was copied from (OpenCode 2.0.27+
+ * records it as `fork.sessionID`), or null. A session never changes what
+ * it was forked from, so each is looked up once.
+ */
+const forkSources = new Map<string, string | null>();
+const MAX_FORK_SOURCES = 500;
+
+export async function forkSourceOf(
+  getSession: (input: { sessionID: string }) => Promise<unknown>,
+  sessionID: string,
+): Promise<string | null> {
+  const known = forkSources.get(sessionID);
+  if (known !== undefined) return known;
+  let source: string | null = null;
+  try {
+    const info = (await getSession({ sessionID })) as { fork?: { sessionID?: unknown } } | undefined;
+    const id = info?.fork?.sessionID;
+    if (typeof id === "string" && id && id !== sessionID) source = id;
+  } catch (err) {
+    // Not remembered: the next request asks again.
+    log.warn(
+      "[opencode-claude] could not read the session to see whether it is a fork",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+  if (forkSources.size >= MAX_FORK_SOURCES) {
+    forkSources.delete(forkSources.keys().next().value!);
+  }
+  forkSources.set(sessionID, source);
+  return source;
+}
+
+/** Fork chains longer than this are cut; each level is one lookup, once. */
+const MAX_FORK_DEPTH = 10;
+
+/**
+ * The sessions a forked session descends from, nearest first. A fork of a
+ * fork that never ran a Claude turn has no Claude session to start from;
+ * an older ancestor may.
+ */
+export async function forkAncestorsOf(
+  getSession: (input: { sessionID: string }) => Promise<unknown>,
+  sessionID: string,
+): Promise<string[]> {
+  const ancestors: string[] = [];
+  let current = sessionID;
+  while (ancestors.length < MAX_FORK_DEPTH) {
+    const source = await forkSourceOf(getSession, current);
+    if (!source || source === sessionID || ancestors.includes(source)) break;
+    ancestors.push(source);
+    current = source;
+  }
+  return ancestors;
 }
 
 type ProviderInfo = Provider.Info;
@@ -238,6 +296,15 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
           directory,
           request.sessionID,
         );
+        // A fork's first turn starts from an ancestor's Claude session (see
+        // inheritSessionBinding), so the proxy needs the ancestors.
+        if (request.kind === "primary" && request.sessionID) {
+          const ancestors = await forkAncestorsOf(
+            (input) => ctx.session.get(input as never),
+            request.sessionID,
+          );
+          if (ancestors.length > 0) request.headers[FORK_SOURCES_HEADER] = ancestors.join(",");
+        }
       },
       { providerID: PROVIDER_ID },
     );

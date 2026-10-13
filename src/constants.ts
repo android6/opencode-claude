@@ -8,6 +8,11 @@ export const SESSION_HEADER = "x-opencode-claude-session";
 export const KIND_HEADER = "x-opencode-claude-kind";
 /** Active OpenCode project directory forwarded to the local Agent SDK proxy. */
 export const DIRECTORY_HEADER = "x-opencode-claude-directory";
+/**
+ * The sessions a forked OpenCode session descends from, comma-separated,
+ * nearest first: what it was forked from, what that was forked from, …
+ */
+export const FORK_SOURCES_HEADER = "x-opencode-claude-fork-sources";
 
 export const EFFORT_LEVELS = [
   "low",

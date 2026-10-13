@@ -45,7 +45,7 @@ OpenCode sends the plugin an ordinary chat request. The plugin turns it into an 
 
 Tools stay OpenCode's. Claude Code's built-in tools (its own Bash, Edit and so on) are switched off. OpenCode's tools are handed to Claude instead, so every file edit and shell command goes through OpenCode and its permissions. When Claude asks for several read-only tools at once, like reads, greps or subagents, they run in parallel.
 
-Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan.
+Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan. A forked chat (Fork from here, `opencode run --fork`, OpenCode 2.0.27 or later) starts from a copy of its parent's Claude session cut at the fork point, so it reads the parent's history from the cache too.
 
 ## Install
 

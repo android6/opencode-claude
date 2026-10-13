@@ -35,6 +35,12 @@ export type ClaudeSessionBinding = {
    * history; the matching boundary says where to resume from.
    */
   turns?: TurnBoundary[];
+  /**
+   * Set on a forked OpenCode session's copy of an ancestor's binding (see
+   * inheritSessionBinding): the Claude session is the ancestor's, so it may
+   * only be forked, never resumed as is. The fork's own session replaces it.
+   */
+  inheritedFrom?: string;
   updatedAt: number;
 };
 
@@ -118,6 +124,7 @@ function sameBinding(a: StoredBinding | undefined, b: StoredBinding): boolean {
     a.leafUuid === b.leafUuid &&
     a.modelId === b.modelId &&
     a.cwd === b.cwd &&
+    a.inheritedFrom === b.inheritedFrom &&
     JSON.stringify(a.turns ?? []) === JSON.stringify(b.turns ?? [])
   );
 }
@@ -185,6 +192,34 @@ export function setForeignSessionId(
     return;
   }
   save(store, next);
+}
+
+/**
+ * A forked OpenCode session holds its ancestor's history up to the fork
+ * point, so it starts with a copy of the ancestor's binding: the Claude
+ * session and every turn boundary, each pinned to the session it was
+ * recorded in. The fork point is then found like a revert's, and the
+ * resume goes through a fork of the ancestor's session cut there. False
+ * when the conversation already has a binding or the ancestor has none.
+ */
+export function inheritSessionBinding(conversationKey: string, fromKey: string): boolean {
+  const store = readStore();
+  const source = store[fromKey];
+  if (store[conversationKey] || !source?.foreignSessionId) return false;
+  const { updatedAt: _updatedAt, ...stored } = source;
+  save(store, {
+    ...stored,
+    conversationKey,
+    ...(stored.turns
+      ? { turns: stored.turns.map((turn) => ({ ...turn, sessionId: turn.sessionId ?? source.foreignSessionId })) }
+      : {}),
+    inheritedFrom: fromKey,
+  });
+  return true;
+}
+
+export function isInheritedBinding(conversationKey: string): boolean {
+  return Boolean(readStore()[conversationKey]?.inheritedFrom);
 }
 
 export function getSessionTurns(conversationKey: string): TurnBoundary[] {

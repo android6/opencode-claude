@@ -42,6 +42,7 @@ import {
 import { getClaudeModels, modelNameFromId, resolveClaudeModelId } from "./models.js";
 import {
   DIRECTORY_HEADER,
+  FORK_SOURCES_HEADER,
   KIND_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
@@ -59,6 +60,8 @@ import {
   getForeignSessionId,
   getSessionLeafUuid,
   getSessionTurns,
+  inheritSessionBinding,
+  isInheritedBinding,
   matchTurnHistory,
   recordTurnStart,
   rewindSessionTurns,
@@ -689,6 +692,16 @@ function summaryResumePoint(
   };
 }
 
+/**
+ * Whether a history ends where a turn of Claude's ended: with an answer, not
+ * inside a tool step. A turn boundary's entry is the end of its turn, so a
+ * fork cut inside a tool step would get the rest of that turn back.
+ */
+function endsAtFinishedTurn(messages: OpenAIMessage[]): boolean {
+  const last = messages.at(-1);
+  return last?.role === "assistant" && (last.tool_calls?.length ?? 0) === 0;
+}
+
 const UTILITY_SYSTEM_PROMPT =
   `You are a text generation helper running in ${currentHost().name} through the Claude Code harness. Follow the instructions in the user message and return only the requested output.`;
 
@@ -1211,6 +1224,27 @@ async function startNewTurn(input: {
     );
   }
 
+  // A forked OpenCode session (Fork from here, `opencode run --fork`) has a
+  // new id and no binding, but its history is an ancestor's up to the fork
+  // point. It takes a copy of the nearest ancestor's binding, and the fork
+  // point is found below like a revert's. Transferred as text, the history
+  // would start a prompt nothing shares and miss the ancestor's cache.
+  if (!isMetaRequest && !getForeignSessionId(conversationKey)) {
+    const ancestors = (req.headers.get(FORK_SOURCES_HEADER) ?? "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id && id !== conversationKey);
+    const from = ancestors.find((ancestor) => inheritSessionBinding(conversationKey, ancestor));
+    if (from) {
+      log.info("[opencode-claude] forked chat; starting from an ancestor's Claude session", {
+        conversationKey,
+        ancestor: from,
+      });
+    }
+  }
+  // The ancestor's session is only ever forked: resumed as is, the fork's
+  // turns would land in the ancestor's chat.
+  const inherited = !isMetaRequest && isInheritedBinding(conversationKey);
   let resume = summaryResume?.sessionId ?? getForeignSessionId(conversationKey);
   const sessionFile = resume ? findClaudeSessionFile(resume) : null;
   if (resume && !sessionFile) {
@@ -1237,6 +1271,13 @@ async function startNewTurn(input: {
   // the user switched to another model for them, or they failed before
   // Claude ran. A resume alone would skip them.
   let missedMessages: typeof priorMessages = [];
+  if (resume && inherited && (answeredStep !== null || !endsAtFinishedTurn(priorMessages))) {
+    log.info("[opencode-claude] forked chat starts inside a tool step; transferring history", {
+      conversationKey,
+    });
+    clearForeignSessionId(conversationKey);
+    resume = undefined;
+  }
   if (resume && sessionFile && !isMetaRequest) {
     const match = matchTurnHistory(
       getSessionTurns(conversationKey),
@@ -1268,18 +1309,25 @@ async function startNewTurn(input: {
       // bring them back. Unless nothing came after it: a retry of a turn
       // that failed before Claude wrote anything resumes as is.
       const untouched =
+        !inherited &&
         source === resume &&
         lastChainEntryUuid(sourceFile) === match.leafUuid &&
         sessionChainAfterLeaf(sourceFile, match.leafUuid) === "clean";
       if (!untouched) forkAt = { sessionId: source, leafUuid: match.leafUuid };
-    } else if (match.kind === "rewind" && !match.leafUuid) {
+    } else if (match.kind === "rewind" && !match.leafUuid && !inherited) {
       // A boundary recorded before this chat's leaf was known: nothing to
       // cut at, so resume the whole session as before.
       log.info("[opencode-claude] OpenCode history went back to a turn with no resume point; resuming the session", {
         conversationKey,
         turn: match.index,
       });
-    } else if (match.kind === "rewind" || match.kind === "diverged") {
+    } else if (
+      match.kind === "rewind" ||
+      match.kind === "diverged" ||
+      // An ancestor's binding from before boundaries were recorded: where
+      // the fork starts in it is unknown.
+      (inherited && match.kind === "untracked")
+    ) {
       log.warn("[opencode-claude] OpenCode history no longer matches the Claude session; transferring history", {
         conversationKey,
         match: match.kind,
@@ -1294,6 +1342,19 @@ async function startNewTurn(input: {
   // The CLI's resumeSessionAt doesn't help there: it only searches the chain
   // it picked and fails with "No message found". A fork cut at the leaf
   // holds exactly our chain, so the resume goes through one when needed.
+  if (resume && sessionFile && !isMetaRequest && !forkAt && inherited) {
+    // A fork at the ancestor's latest turn: cut at the ancestor's leaf.
+    const leafUuid = getSessionLeafUuid(conversationKey);
+    if (leafUuid && sessionFileHasEntry(sessionFile, leafUuid)) {
+      forkAt = { sessionId: resume, leafUuid };
+    } else {
+      log.warn("[opencode-claude] forked chat: the ancestor's last entry is not in its Claude session; transferring history", {
+        conversationKey,
+      });
+      clearForeignSessionId(conversationKey);
+      resume = undefined;
+    }
+  }
   if (resume && sessionFile && !isMetaRequest && !forkAt) {
     const leafUuid = getSessionLeafUuid(conversationKey);
     if (leafUuid) {
