@@ -122,9 +122,9 @@ async function refreshModelCatalog(reload: () => Promise<void>) {
   if (now - lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
   lastModelRefresh = now;
   try {
-    const rows = await listClaudeSupportedModels();
-    if (!rows?.length) return;
-    if (setDiscoveredModels(modelsFromSdk(rows as SdkModelRow[]))) {
+    const found = await listClaudeSupportedModels();
+    if (!found?.rows.length) return;
+    if (setDiscoveredModels(modelsFromSdk(found.rows as SdkModelRow[], found.windows))) {
       await reload();
     }
   } catch (err) {

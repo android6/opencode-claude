@@ -11,6 +11,7 @@ import {
   resolveClaudeCodeExecutable,
 } from "./executable-path.js";
 import { log } from "./log.js";
+import { contextProbeIds, type SdkModelRow } from "./models.js";
 
 type SdkModule = typeof import("@anthropic-ai/claude-agent-sdk");
 
@@ -564,13 +565,87 @@ export async function startClaudeQuery(
   });
 }
 
+/** Wait per model id for the CLI's context window; a stuck CLI ends the probe. */
+const CONTEXT_PROBE_TIMEOUT_MS = 10_000;
+
+export type ClaudeModelDiscovery = {
+  /** The CLI's `supportedModels()` rows. */
+  rows: unknown[];
+  /**
+   * Context window the CLI itself runs each model id with, plain and `[1m]`
+   * (`getContextUsage().rawMaxTokens`); null when the CLI refused the id.
+   * Ids missing here were not probed (old CLI, timeout).
+   */
+  windows: Map<string, number | null>;
+};
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<{ value: T } | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ value })),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+type DiscoveryQuery = {
+  supportedModels?: () => Promise<unknown[]>;
+  setModel?: (model?: string) => Promise<void>;
+  getContextUsage?: () => Promise<{ rawMaxTokens?: unknown }>;
+  close?: () => void;
+};
+
 /**
- * Ask the local CLI which models this account can use. Starts a Claude Code
- * process with no prompt: no model call is made and nothing is persisted.
+ * Switch the idle query to each id and read the window the CLI uses for it.
+ * The CLI answers per account and per CLI version: Opus 4.6 runs at 200K
+ * and at 1M only as `[1m]`, a plan without 1M access refuses `[1m]`, and
+ * CLAUDE_CODE_DISABLE_1M_CONTEXT turns every model down to 200K.
+ */
+async function probeContextWindows(
+  q: DiscoveryQuery,
+  ids: string[],
+): Promise<Map<string, number | null>> {
+  const windows = new Map<string, number | null>();
+  const setModel = q.setModel;
+  const getContextUsage = q.getContextUsage;
+  if (typeof setModel !== "function" || typeof getContextUsage !== "function") {
+    return windows;
+  }
+  for (const id of ids) {
+    const answer = await withTimeout(
+      setModel.call(q, id).then(
+        async () => {
+          const usage = await getContextUsage.call(q);
+          const tokens = usage?.rawMaxTokens;
+          return typeof tokens === "number" && tokens > 0 ? tokens : null;
+        },
+        // "Sonnet with 1M context is not available for your account" and the like.
+        () => null,
+      ),
+      CONTEXT_PROBE_TIMEOUT_MS,
+    );
+    if (!answer) break;
+    windows.set(id, answer.value);
+  }
+  return windows;
+}
+
+/**
+ * Ask the local CLI which models this account can use and the context window
+ * of each. Starts a Claude Code process with no prompt: no message is sent to
+ * a model and nothing is persisted.
  */
 export async function listClaudeSupportedModels(
   timeoutMs = 20_000,
-): Promise<unknown[] | null> {
+): Promise<ClaudeModelDiscovery | null> {
   const sdk = await loadClaudeAgentSdk();
   const queryFn = (sdk as { query?: Function }).query;
   if (typeof queryFn !== "function") return null;
@@ -587,26 +662,25 @@ export async function listClaudeSupportedModels(
     options: {
       env,
       persistSession: false,
-      settingSources: [],
+      // The user's settings, as in a chat: CLAUDE_CODE_DISABLE_1M_CONTEXT in
+      // settings.json `env` changes the windows. Their hooks stay off.
+      settingSources: ["user"],
       strictMcpConfig: true,
-      settings: { disableClaudeAiConnectors: true },
+      settings: { disableClaudeAiConnectors: true, disableAllHooks: true },
       ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
       ...(pathToClaudeCodeExecutable && isJsEntrypoint(pathToClaudeCodeExecutable)
         ? { executable: "node" as const }
         : {}),
     },
-  }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  }) as DiscoveryQuery;
   try {
     if (typeof q.supportedModels !== "function") return null;
-    return await Promise.race([
-      q.supportedModels(),
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), timeoutMs);
-      }),
-    ]);
+    const listed = await withTimeout(q.supportedModels(), timeoutMs);
+    if (!listed) return null;
+    const rows = listed.value;
+    const windows = await probeContextWindows(q, contextProbeIds(rows as SdkModelRow[]));
+    return { rows, windows };
   } finally {
-    if (timer) clearTimeout(timer);
     release();
     q.close?.();
   }

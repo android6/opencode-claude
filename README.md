@@ -79,7 +79,7 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 ## Using it
 
-**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Opus, Fable and some Sonnet models come in 1M-context versions. Context limits and effort levels show up in OpenCode's model details.
+**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. The context window of each model is the one your CLI runs it with: current models run at 1M, a model that reaches 1M only through Claude Code's `[1m]` variant (Opus 4.6) is listed twice, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` lists everything at 200K. Context limits and effort levels show up in OpenCode's model details.
 
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
@@ -100,7 +100,7 @@ Your plan's limits go mostly to context: each step of an agent loop re-reads the
 - Start a new session for a new task instead of stretching one session over a day's work.
 - Coming back to a long session after a break costs more, because the cache has expired and the whole context is written again.
 - Plugins that rewrite OpenCode's history on every turn (context pruning and the like) break the cache and make every turn much more expensive with Claude.
-- 1M models compact around 90% of the window. If you don't need the room, the regular versions stay smaller.
+- 1M models compact around 90% of the window. If you don't need the room, `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` keeps every model at 200K.
 
 ## Troubleshooting
 
