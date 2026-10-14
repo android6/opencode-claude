@@ -4,6 +4,9 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { isClaudeEffort, type ClaudeEffort } from "./constants.js";
 import {
@@ -13,6 +16,7 @@ import {
 } from "./executable-path.js";
 import { log } from "./log.js";
 import {
+  cacheForListedModels,
   extendedProbeIds,
   listedModelIds,
   readContextWindowCache,
@@ -630,9 +634,31 @@ async function currentContextWindow(q: DiscoveryQuery): Promise<number | null> {
 }
 
 /**
+ * CLAUDE_CODE_DISABLE_1M_CONTEXT as set in the user's Claude Code
+ * settings.json `env`. Read on each model-list refresh, like the variable in
+ * the environment; a change shows at the next refresh. The CLI also reports
+ * its merged settings through `getSettings()` (SDK 0.3.300, not in the
+ * SDK's public types), which covers organization-managed settings too; the
+ * documented file is used instead.
+ */
+export function settingsDisable1MContext(
+  env: Record<string, string | undefined>,
+): string | undefined {
+  try {
+    const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+    const settings = JSON.parse(readFileSync(join(configDir, "settings.json"), "utf8")) as {
+      env?: Record<string, unknown>;
+    };
+    const value = settings?.env?.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+    return value === undefined || value === null ? undefined : String(value);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * What the CLI's windows depend on besides the model id: the CLI version,
- * the account, and the 1M switch in the environment. The switch set in
- * settings.json is not seen here; the cache's one-day limit catches it.
+ * the account, and the 1M switch, in the environment and in settings.json.
  */
 async function contextWindowKey(
   q: DiscoveryQuery,
@@ -650,6 +676,7 @@ async function contextWindowKey(
     account.subscriptionType,
     account.apiProvider,
     env.CLAUDE_CODE_DISABLE_1M_CONTEXT,
+    settingsDisable1MContext(env),
   ];
   // A digest, so the cache file holds no email address.
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 16);
@@ -749,14 +776,16 @@ export async function listClaudeSupportedModels(
     const windows = new Map<string, number | null>();
     if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
       const key = await contextWindowKey(q, env);
-      const cached = readContextWindowCache(key);
+      const listed = listedModelIds(rows as SdkModelRow[]);
+      const cached = cacheForListedModels(readContextWindowCache(key), listed);
       for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
+      // With a cache, only ids the CLI could not answer last time are asked.
       if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
         writeContextWindowCache({
           key,
-          // New models join the day already running; the day starts over
-          // only when everything was asked.
+          // The day starts over only when everything was asked.
           savedAt: cached?.savedAt ?? Date.now(),
+          models: cached?.models ?? listed,
           windows: Object.fromEntries(windows),
         });
       }

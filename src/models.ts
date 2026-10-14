@@ -217,12 +217,15 @@ function modelCachePath(): string {
  * the id (a `[1m]` variant the plan does not include). Asking costs a model
  * request per id (`setModel` checks a new model with a one-token call), so
  * answers are kept while `key` stays the same (CLI version, account, the
- * 1M switch) and for a day at most: the day also catches what Anthropic
- * changes on its side without a new CLI, such as 1M access for the account.
+ * 1M switch) and the CLI lists no new model, and for a day at most: the day
+ * also catches what Anthropic changes on its side without a new CLI, such
+ * as 1M access for the account.
  */
 export type ContextWindowCache = {
   key: string;
   savedAt: number;
+  /** The listed models the windows were taken for. */
+  models: string[];
   windows: Record<string, number | null>;
 };
 
@@ -241,10 +244,24 @@ export function readContextWindowCache(
     // A savedAt in the future means the clock moved back: ask again.
     if (parsed.savedAt > now || now - parsed.savedAt >= CONTEXT_WINDOW_CACHE_TTL_MS) return null;
     if (!parsed.windows || typeof parsed.windows !== "object") return null;
-    return { key, savedAt: parsed.savedAt, windows: parsed.windows };
+    if (!Array.isArray(parsed.models)) return null;
+    return { key, savedAt: parsed.savedAt, models: parsed.models, windows: parsed.windows };
   } catch {
     return null;
   }
+}
+
+/**
+ * The cache, or null when the CLI lists a model it was not taken for. A new
+ * model can come with changes to the others (a CLI or catalog update), so
+ * everything is asked again rather than the new model alone.
+ */
+export function cacheForListedModels(
+  cache: ContextWindowCache | null,
+  listed: string[],
+): ContextWindowCache | null {
+  if (!cache) return null;
+  return listed.every((id) => cache.models.includes(id)) ? cache : null;
 }
 
 export function writeContextWindowCache(cache: ContextWindowCache): void {

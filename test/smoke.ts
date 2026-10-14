@@ -655,13 +655,33 @@ async function main() {
   // The window cache holds while the CLI, the account and the 1M switch stay
   // the same, for a day at most
   {
-    const { readContextWindowCache, writeContextWindowCache } = await import("../src/models.ts");
+    const { readContextWindowCache, writeContextWindowCache, cacheForListedModels, listedModelIds } =
+      await import("../src/models.ts");
     const now = Date.now();
-    writeContextWindowCache({ key: "k1", savedAt: now, windows: cliWindows });
-    assert.deepEqual(readContextWindowCache("k1", now + 60_000)?.windows, cliWindows);
+    const models = listedModelIds(cliRows);
+    writeContextWindowCache({ key: "k1", savedAt: now, models, windows: cliWindows });
+    const cache = readContextWindowCache("k1", now + 60_000);
+    assert.deepEqual(cache?.windows, cliWindows);
     assert.equal(readContextWindowCache("k2", now), null, "another CLI, account or 1M switch");
     assert.equal(readContextWindowCache("k1", now + 24 * 60 * 60_000), null, "a day old");
     assert.equal(readContextWindowCache("k1", now - 1), null, "the clock moved back");
+    // A model the cache was not taken for drops the whole cache
+    assert.equal(cacheForListedModels(cache, models), cache);
+    assert.equal(cacheForListedModels(cache, models.slice(1)), cache, "a model gone is no reason");
+    assert.equal(cacheForListedModels(cache, [...models, "claude-fable-5-1"]), null);
+  }
+  // The 1M switch in Claude Code's settings.json joins the cache key
+  {
+    const { settingsDisable1MContext } = await import("../src/query.ts");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const configDir = mkdtempSync(join(tmpdir(), "oc-claude-config-"));
+    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), undefined, "no settings.json");
+    writeFileSync(join(configDir, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" } }));
+    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), "1");
+    writeFileSync(join(configDir, "settings.json"), "{ not json");
+    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), undefined, "unreadable file");
   }
   {
     const fromCli = modelsFromSdk(cliRows);
