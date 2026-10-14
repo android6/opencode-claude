@@ -3,6 +3,7 @@
  * Import failure is surfaced as unavailable — detect must not report ready.
  */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { isClaudeEffort, type ClaudeEffort } from "./constants.js";
 import {
@@ -11,7 +12,13 @@ import {
   resolveClaudeCodeExecutable,
 } from "./executable-path.js";
 import { log } from "./log.js";
-import { contextProbeIds, type SdkModelRow } from "./models.js";
+import {
+  extendedProbeIds,
+  listedModelIds,
+  readContextWindowCache,
+  writeContextWindowCache,
+  type SdkModelRow,
+} from "./models.js";
 
 type SdkModule = typeof import("@anthropic-ai/claude-agent-sdk");
 
@@ -574,7 +581,7 @@ export type ClaudeModelDiscovery = {
   /**
    * Context window the CLI itself runs each model id with, plain and `[1m]`
    * (`getContextUsage().rawMaxTokens`); null when the CLI refused the id.
-   * Ids missing here were not probed (old CLI, timeout).
+   * Ids missing here could not be asked (old CLI, timeout).
    */
   windows: Map<string, number | null>;
 };
@@ -596,52 +603,117 @@ async function withTimeout<T>(
   }
 }
 
+type ContextUsage = { rawMaxTokens?: unknown; model?: unknown };
+
 type DiscoveryQuery = {
   supportedModels?: () => Promise<unknown[]>;
+  initializationResult?: () => Promise<{
+    claude_code_version?: unknown;
+    account?: Record<string, unknown>;
+  }>;
   setModel?: (model?: string) => Promise<void>;
-  getContextUsage?: () => Promise<{ rawMaxTokens?: unknown }>;
+  // SDK 0.3.224 takes no options and sends the full form; newer SDKs pass
+  // `detail` on.
+  getContextUsage?: (options?: { detail?: "summary" | "full" }) => Promise<ContextUsage>;
   close?: () => void;
 };
 
 /**
- * Switch the idle query to each id and read the window the CLI uses for it.
- * The CLI answers per account and per CLI version: Opus 4.6 runs at 200K
- * and at 1M only as `[1m]`, a plan without 1M access refuses `[1m]`, and
- * CLAUDE_CODE_DISABLE_1M_CONTEXT turns every model down to 200K.
+ * Window of the model the query runs now. `summary` makes the CLI answer
+ * locally; the default full form also counts each part of the context
+ * through the token-count API, which the window does not need.
  */
-async function probeContextWindows(
+async function currentContextWindow(q: DiscoveryQuery): Promise<number | null> {
+  const usage = await q.getContextUsage!({ detail: "summary" });
+  const tokens = usage?.rawMaxTokens;
+  return typeof tokens === "number" && tokens > 0 ? tokens : null;
+}
+
+/**
+ * What the CLI's windows depend on besides the model id: the CLI version,
+ * the account, and the 1M switch. The switch shows in the window of the
+ * model the CLI starts with, asked before any setModel, so it costs no
+ * model request and covers the switch in settings.json as well as in the
+ * environment.
+ */
+async function contextWindowKey(q: DiscoveryQuery): Promise<string> {
+  const init = await withTimeout(
+    q.initializationResult?.() ?? Promise.resolve(undefined),
+    CONTEXT_PROBE_TIMEOUT_MS,
+  );
+  const account = init?.value?.account ?? {};
+  const start = await withTimeout(
+    q.getContextUsage!({ detail: "summary" }).catch(() => null),
+    CONTEXT_PROBE_TIMEOUT_MS,
+  );
+  const parts = [
+    init?.value?.claude_code_version,
+    account.email,
+    account.organization,
+    account.subscriptionType,
+    account.apiProvider,
+    start?.value?.model,
+    start?.value?.rawMaxTokens,
+  ];
+  // A digest, so the cache file holds no email address.
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Switch the idle query to `id` and read the window the CLI uses for it;
+ * null when the CLI refuses the id ("Sonnet with 1M context is not available
+ * for your account"), "timeout" when it stops answering.
+ */
+async function askContextWindow(
   q: DiscoveryQuery,
-  ids: string[],
-): Promise<Map<string, number | null>> {
-  const windows = new Map<string, number | null>();
-  const setModel = q.setModel;
-  const getContextUsage = q.getContextUsage;
-  if (typeof setModel !== "function" || typeof getContextUsage !== "function") {
-    return windows;
+  id: string,
+): Promise<number | null | "timeout"> {
+  const answer = await withTimeout(
+    q.setModel!(id).then(
+      () => currentContextWindow(q),
+      () => null,
+    ),
+    CONTEXT_PROBE_TIMEOUT_MS,
+  );
+  return answer ? answer.value : "timeout";
+}
+
+/**
+ * Fill `windows` with what is missing for the listed models. The CLI answers
+ * per account and per CLI version: Opus 4.6 runs at 200K and at 1M only as
+ * `[1m]`, a plan without 1M access refuses `[1m]`, and
+ * CLAUDE_CODE_DISABLE_1M_CONTEXT turns every model down to 200K. Returns
+ * whether anything was added.
+ */
+export async function askMissingContextWindows(
+  q: DiscoveryQuery,
+  rows: SdkModelRow[],
+  windows: Map<string, number | null>,
+): Promise<boolean> {
+  let added = false;
+  for (const id of listedModelIds(rows)) {
+    if (windows.has(id)) continue;
+    const window = await askContextWindow(q, id);
+    if (window === "timeout") return added;
+    // A plain id that failed is asked again next time; the table covers it.
+    if (window === null) continue;
+    windows.set(id, window);
+    added = true;
   }
-  for (const id of ids) {
-    const answer = await withTimeout(
-      setModel.call(q, id).then(
-        async () => {
-          const usage = await getContextUsage.call(q);
-          const tokens = usage?.rawMaxTokens;
-          return typeof tokens === "number" && tokens > 0 ? tokens : null;
-        },
-        // "Sonnet with 1M context is not available for your account" and the like.
-        () => null,
-      ),
-      CONTEXT_PROBE_TIMEOUT_MS,
-    );
-    if (!answer) break;
-    windows.set(id, answer.value);
+  for (const id of extendedProbeIds(rows, windows)) {
+    const window = await askContextWindow(q, id);
+    if (window === "timeout") return added;
+    windows.set(id, window);
+    added = true;
   }
-  return windows;
+  return added;
 }
 
 /**
  * Ask the local CLI which models this account can use and the context window
- * of each. Starts a Claude Code process with no prompt: no message is sent to
- * a model and nothing is persisted.
+ * of each. Starts a Claude Code process with no prompt and persists nothing.
+ * The list costs no model request; a window not yet in the cache costs one
+ * (see askContextWindow), so only those are asked.
  */
 export async function listClaudeSupportedModels(
   timeoutMs = 20_000,
@@ -678,7 +750,21 @@ export async function listClaudeSupportedModels(
     const listed = await withTimeout(q.supportedModels(), timeoutMs);
     if (!listed) return null;
     const rows = listed.value;
-    const windows = await probeContextWindows(q, contextProbeIds(rows as SdkModelRow[]));
+    const windows = new Map<string, number | null>();
+    if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
+      const key = await contextWindowKey(q);
+      const cached = readContextWindowCache(key);
+      for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
+      if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
+        writeContextWindowCache({
+          key,
+          // New models join the day already running; the day starts over
+          // only when everything was asked.
+          savedAt: cached?.savedAt ?? Date.now(),
+          windows: Object.fromEntries(windows),
+        });
+      }
+    }
     return { rows, windows };
   } finally {
     release();

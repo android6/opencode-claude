@@ -566,20 +566,29 @@ async function main() {
     { value: "claude-sonnet-4-6", displayName: "Sonnet 4.6", resolvedModel: "claude-sonnet-4-6" },
     { value: "haiku", displayName: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
   ];
+  // What CLI 2.1.300 answered on a Max plan, plain ids and the [1m] variants
+  // worth asking
+  const cliWindows: Record<string, number | null> = {
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-6": 200_000, "claude-opus-4-6[1m]": 1_000_000,
+    "claude-sonnet-4-6": 200_000, "claude-sonnet-4-6[1m]": null,
+    "claude-haiku-4-5-20251001": 200_000, "claude-haiku-4-5-20251001[1m]": null,
+  };
   {
-    const { contextProbeIds } = await import("../src/models.ts");
-    assert.deepEqual(contextProbeIds(cliRows).slice(0, 4), [
-      "claude-opus-5-5", "claude-opus-5-5[1m]", "claude-sonnet-5", "claude-sonnet-5[1m]",
+    const { listedModelIds, extendedProbeIds } = await import("../src/models.ts");
+    assert.deepEqual(listedModelIds(cliRows), [
+      "claude-opus-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-6",
+      "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
     ]);
-    // What CLI 2.1.300 answered on a Max plan
-    const windows = new Map<string, number | null>([
-      ["claude-opus-5-5", 1_000_000], ["claude-opus-5-5[1m]", 1_000_000],
-      ["claude-sonnet-5", 1_000_000], ["claude-sonnet-5[1m]", 1_000_000],
-      ["claude-opus-4-8", 1_000_000], ["claude-opus-4-8[1m]", 1_000_000],
-      ["claude-opus-4-6", 200_000], ["claude-opus-4-6[1m]", 1_000_000],
-      ["claude-sonnet-4-6", 200_000], ["claude-sonnet-4-6[1m]", null],
-      ["claude-haiku-4-5-20251001", 200_000], ["claude-haiku-4-5-20251001[1m]", null],
+    // [1m] is asked only where the plain id runs below 1M, and only once
+    const plainOnly = new Map(Object.entries(cliWindows).filter(([id]) => !id.endsWith("[1m]")));
+    assert.deepEqual(extendedProbeIds(cliRows, plainOnly), [
+      "claude-opus-4-6[1m]", "claude-sonnet-4-6[1m]", "claude-haiku-4-5-20251001[1m]",
     ]);
+    const windows = new Map(Object.entries(cliWindows));
+    assert.deepEqual(extendedProbeIds(cliRows, windows), []);
     const probed = modelsFromSdk(cliRows, windows);
     assert.deepEqual(
       probed.map((m) => `${m.id} ${m.contextWindow}/${m.maxTokens}`),
@@ -600,6 +609,59 @@ async function main() {
     // A model the CLI could not size falls back to the table
     const partial = modelsFromSdk(cliRows, new Map([["claude-opus-5-5", 1_000_000]]));
     assert.equal(partial.find((m) => m.id === "claude-sonnet-5")!.contextWindow, 1_000_000);
+  }
+  // Each window costs the CLI a model request, so only what is missing is asked
+  {
+    const { askMissingContextWindows } = await import("../src/query.ts");
+    const asked: string[] = [];
+    const fakeCli = (answers: Record<string, number | null>) => {
+      let current = "";
+      return {
+        setModel: async (id: string) => {
+          asked.push(id);
+          if (typeof answers[id] !== "number") throw new Error("not available for your account");
+          current = id;
+        },
+        getContextUsage: async () => ({ rawMaxTokens: answers[current], model: current }),
+      };
+    };
+    const windows = new Map<string, number | null>();
+    assert.equal(await askMissingContextWindows(fakeCli(cliWindows) as any, cliRows, windows), true);
+    assert.deepEqual(asked, [
+      "claude-opus-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-6",
+      "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+      "claude-opus-4-6[1m]", "claude-sonnet-4-6[1m]", "claude-haiku-4-5-20251001[1m]",
+    ]);
+    assert.deepEqual(Object.fromEntries(windows), cliWindows);
+    // Everything known: no model request at all
+    asked.length = 0;
+    assert.equal(await askMissingContextWindows(fakeCli(cliWindows) as any, cliRows, windows), false);
+    assert.deepEqual(asked, []);
+    // A new model in the list: only it is asked
+    const withFable = [...cliRows, { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1" }];
+    await askMissingContextWindows(
+      fakeCli({ ...cliWindows, "claude-fable-5-1": 1_000_000 }) as any,
+      withFable,
+      windows,
+    );
+    assert.deepEqual(asked, ["claude-fable-5-1"]);
+    // A plain id the CLI could not answer is not stored: asked again next time
+    asked.length = 0;
+    const failed = new Map<string, number | null>();
+    await askMissingContextWindows(fakeCli({}) as any, cliRows.slice(0, 2), failed);
+    assert.equal(failed.size, 0);
+    assert.deepEqual(asked, ["claude-opus-5-5"]);
+  }
+  // The window cache holds while the CLI, the account and the 1M switch stay
+  // the same, for a day at most
+  {
+    const { readContextWindowCache, writeContextWindowCache } = await import("../src/models.ts");
+    const now = Date.now();
+    writeContextWindowCache({ key: "k1", savedAt: now, windows: cliWindows });
+    assert.deepEqual(readContextWindowCache("k1", now + 60_000)?.windows, cliWindows);
+    assert.equal(readContextWindowCache("k2", now), null, "another CLI, account or 1M switch");
+    assert.equal(readContextWindowCache("k1", now + 24 * 60 * 60_000), null, "a day old");
+    assert.equal(readContextWindowCache("k1", now - 1), null, "the clock moved back");
   }
   {
     const fromCli = modelsFromSdk(cliRows);

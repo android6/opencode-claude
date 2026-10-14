@@ -1,7 +1,7 @@
 /**
  * Claude Code model catalog (from OpenChamber harness registry).
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -94,17 +94,31 @@ function rowBaseId(row: SdkModelRow): string | undefined {
   return (row.resolvedModel || value).replace(/\[1m\]$/i, "");
 }
 
-/** Ids whose context window the CLI is asked for: every listed model, plain and `[1m]`. */
-export function contextProbeIds(rows: SdkModelRow[]): string[] {
+/** Concrete ids of the listed models, without `[1m]`, each once. */
+export function listedModelIds(rows: SdkModelRow[]): string[] {
   const ids: string[] = [];
   for (const row of rows) {
     const base = rowBaseId(row);
-    if (!base) continue;
-    for (const id of [base, `${base}[1m]`]) {
-      if (!ids.includes(id)) ids.push(id);
-    }
+    if (base && !ids.includes(base)) ids.push(base);
   }
   return ids;
+}
+
+/**
+ * `[1m]` variants worth asking the CLI about: only where the plain id runs
+ * below 1M (Opus 4.6). A model that already runs at 1M gains nothing from
+ * the suffix, and every question costs a model request.
+ */
+export function extendedProbeIds(
+  rows: SdkModelRow[],
+  windows: ReadonlyMap<string, number | null>,
+): string[] {
+  return listedModelIds(rows)
+    .filter((id) => {
+      const plain = windows.get(id);
+      return typeof plain === "number" && plain < LIMIT_1M.context && !windows.has(`${id}[1m]`);
+    })
+    .map((id) => `${id}[1m]`);
 }
 
 /**
@@ -189,9 +203,61 @@ export function setDiscoveredModels(models: ClaudeModel[]): boolean {
   return changed;
 }
 
-function modelCachePath(): string {
+function dataFilePath(name: string): string {
   const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", "models.json");
+  return join(base, "opencode-claude", name);
+}
+
+function modelCachePath(): string {
+  return dataFilePath("models.json");
+}
+
+/**
+ * Context windows the CLI reported, by model id; null means the CLI refused
+ * the id (a `[1m]` variant the plan does not include). Asking costs a model
+ * request per id (`setModel` checks a new model with a one-token call), so
+ * answers are kept while `key` stays the same (CLI version, account, the
+ * 1M switch) and for a day at most: the day also catches what Anthropic
+ * changes on its side without a new CLI, such as 1M access for the account.
+ */
+export type ContextWindowCache = {
+  key: string;
+  savedAt: number;
+  windows: Record<string, number | null>;
+};
+
+const CONTEXT_WINDOW_CACHE_TTL_MS = 24 * 60 * 60_000;
+
+/** The stored windows if they were taken under `key` less than a day ago. */
+export function readContextWindowCache(
+  key: string,
+  now = Date.now(),
+): ContextWindowCache | null {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(dataFilePath("context-windows.json"), "utf8"),
+    ) as Partial<ContextWindowCache>;
+    if (parsed.key !== key || typeof parsed.savedAt !== "number") return null;
+    // A savedAt in the future means the clock moved back: ask again.
+    if (parsed.savedAt > now || now - parsed.savedAt >= CONTEXT_WINDOW_CACHE_TTL_MS) return null;
+    if (!parsed.windows || typeof parsed.windows !== "object") return null;
+    return { key, savedAt: parsed.savedAt, windows: parsed.windows };
+  } catch {
+    return null;
+  }
+}
+
+export function writeContextWindowCache(cache: ContextWindowCache): void {
+  try {
+    const file = dataFilePath("context-windows.json");
+    mkdirSync(dirname(file), { recursive: true });
+    // Whole file or nothing: two OpenCode servers can write it at once.
+    const temp = `${file}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify(cache, null, 2));
+    renameSync(temp, file);
+  } catch {
+    // Without the file the windows are asked again next time.
+  }
 }
 
 function readCachedModels(): ClaudeModel[] | null {
