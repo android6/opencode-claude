@@ -4,7 +4,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
@@ -657,12 +657,30 @@ export function settingsDisable1MContext(
 }
 
 /**
- * What the CLI's windows depend on besides the model id: the CLI version,
- * the account, and the 1M switch, in the environment and in settings.json.
+ * Which CLI build runs: its real path, size and modification time. CLIs
+ * before 2.1.300 do not report `claude_code_version` at initialize, and an
+ * update replaces the file (the native installer and npm both do), so the
+ * file tells an update apart without starting `claude --version`.
+ */
+export function cliFileStamp(executable: string | undefined): string | undefined {
+  if (!executable) return undefined;
+  try {
+    const real = realpathSync(executable);
+    const stat = statSync(real);
+    return `${real}|${stat.size}|${stat.mtimeMs}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What the CLI's windows depend on besides the model id: the CLI build, the
+ * account, and the 1M switch, in the environment and in settings.json.
  */
 async function contextWindowKey(
   q: DiscoveryQuery,
   env: Record<string, string | undefined>,
+  executable: string | undefined,
 ): Promise<string> {
   const init = await withTimeout(
     q.initializationResult?.() ?? Promise.resolve(undefined),
@@ -671,6 +689,7 @@ async function contextWindowKey(
   const account = init?.value?.account ?? {};
   const parts = [
     init?.value?.claude_code_version,
+    cliFileStamp(executable),
     account.email,
     account.organization,
     account.subscriptionType,
@@ -775,7 +794,7 @@ export async function listClaudeSupportedModels(
     const rows = listed.value;
     const windows = new Map<string, number | null>();
     if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
-      const key = await contextWindowKey(q, env);
+      const key = await contextWindowKey(q, env, pathToClaudeCodeExecutable ?? undefined);
       const listed = listedModelIds(rows as SdkModelRow[]);
       const cached = cacheForListedModels(readContextWindowCache(key), listed);
       for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);

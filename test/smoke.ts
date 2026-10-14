@@ -683,6 +683,24 @@ async function main() {
     writeFileSync(join(configDir, "settings.json"), "{ not json");
     assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), undefined, "unreadable file");
   }
+  // A CLI update replaces the executable; CLIs before 2.1.300 do not report
+  // their version, so the file stands for the build in the cache key
+  {
+    const { cliFileStamp } = await import("../src/query.ts");
+    const { mkdtempSync, writeFileSync, utimesSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const exe = join(mkdtempSync(join(tmpdir(), "oc-claude-exe-")), "claude.exe");
+    writeFileSync(exe, "build 1");
+    utimesSync(exe, new Date(2026, 9, 11), new Date(2026, 9, 11));
+    const before = cliFileStamp(exe);
+    assert.ok(before);
+    assert.equal(cliFileStamp(exe), before, "same file, same stamp");
+    writeFileSync(exe, "build 2, longer");
+    assert.notEqual(cliFileStamp(exe), before, "an update changes the stamp");
+    assert.equal(cliFileStamp(join(exe, "..", "missing.exe")), undefined);
+    assert.equal(cliFileStamp(undefined), undefined, "the SDK's own CLI");
+  }
   {
     const fromCli = modelsFromSdk(cliRows);
     const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
