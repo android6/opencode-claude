@@ -616,8 +616,9 @@ type DiscoveryQuery = {
     account?: Record<string, unknown>;
   }>;
   setModel?: (model?: string) => Promise<void>;
-  // SDK 0.3.224 takes no options and sends the full form; newer SDKs pass
-  // `detail` on.
+  // SDK 0.3.300 (the version package.json requires) passes `detail` on;
+  // 0.3.224 dropped it. A CLI as old as 2.1.237 ignores `detail` and answers
+  // in the full form, still with the right window.
   getContextUsage?: (options?: { detail?: "summary" | "full" }) => Promise<ContextUsage>;
   close?: () => void;
 };
