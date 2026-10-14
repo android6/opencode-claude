@@ -631,29 +631,25 @@ async function currentContextWindow(q: DiscoveryQuery): Promise<number | null> {
 
 /**
  * What the CLI's windows depend on besides the model id: the CLI version,
- * the account, and the 1M switch. The switch shows in the window of the
- * model the CLI starts with, asked before any setModel, so it costs no
- * model request and covers the switch in settings.json as well as in the
- * environment.
+ * the account, and the 1M switch in the environment. The switch set in
+ * settings.json is not seen here; the cache's one-day limit catches it.
  */
-async function contextWindowKey(q: DiscoveryQuery): Promise<string> {
+async function contextWindowKey(
+  q: DiscoveryQuery,
+  env: Record<string, string | undefined>,
+): Promise<string> {
   const init = await withTimeout(
     q.initializationResult?.() ?? Promise.resolve(undefined),
     CONTEXT_PROBE_TIMEOUT_MS,
   );
   const account = init?.value?.account ?? {};
-  const start = await withTimeout(
-    q.getContextUsage!({ detail: "summary" }).catch(() => null),
-    CONTEXT_PROBE_TIMEOUT_MS,
-  );
   const parts = [
     init?.value?.claude_code_version,
     account.email,
     account.organization,
     account.subscriptionType,
     account.apiProvider,
-    start?.value?.model,
-    start?.value?.rawMaxTokens,
+    env.CLAUDE_CODE_DISABLE_1M_CONTEXT,
   ];
   // A digest, so the cache file holds no email address.
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 16);
@@ -752,7 +748,7 @@ export async function listClaudeSupportedModels(
     const rows = listed.value;
     const windows = new Map<string, number | null>();
     if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
-      const key = await contextWindowKey(q);
+      const key = await contextWindowKey(q, env);
       const cached = readContextWindowCache(key);
       for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
       if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
