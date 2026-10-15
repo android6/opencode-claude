@@ -632,8 +632,12 @@ type SummaryResumePoint = {
  * characters per token of the chat model's window. OpenCode already sized
  * the request to that window, so this only guards against a runaway one.
  */
-function summaryHistoryMaxChars(model: string): number {
-  return (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000) * 3;
+export function summaryHistoryMaxChars(model: string): number {
+  // The catalog knows the window: a model with a native 1M window has no
+  // `[1m]` in its id. The suffix only decides for an id it does not list.
+  const listed = getClaudeModels().find((m) => m.id === model || m.resolvedId === model);
+  const tokens = listed?.contextWindow ?? (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000);
+  return tokens * 3;
 }
 
 const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";

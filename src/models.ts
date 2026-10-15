@@ -66,20 +66,6 @@ export type SdkModelRow = {
   supportedEffortLevels?: string[];
 };
 
-/**
- * 1M context rules per model family, used only when the CLI could not report
- * its windows (old CLI, timeout). Claude Code selects 1M through a `[1m]`
- * suffix on the model id; the suffix never reaches the API.
- * - optional: the plain id runs at 200K, the `[1m]` variant at 1M
- * - fixed: the plain id already runs at 1M
- * Any other model is listed at 200K.
- */
-const ONE_M_FAMILIES: Array<{ match: RegExp; mode: "optional" | "fixed" }> = [
-  { match: /^claude-(opus|sonnet)-4-6/, mode: "optional" },
-  { match: /^claude-opus-4-[78]/, mode: "fixed" },
-  { match: /^claude-(fable|opus|sonnet|haiku)-5/, mode: "fixed" },
-];
-
 /** Output limit that goes with a context window. */
 function limitFor(context: number): { context: number; output: number } {
   const output = context > LIMIT_200K.context ? LIMIT_1M.output : LIMIT_200K.output;
@@ -136,15 +122,21 @@ export function modelNameFromId(id: string | undefined): string | undefined {
 }
 
 /**
- * Map the CLI's own model list (supportedModels) into the catalog, with the
- * context window the CLI reported for each id. A model gets a second "(1M)"
- * entry only when its `[1m]` variant runs a larger window than the plain id
- * (Opus 4.6); a refused `[1m]` variant is not listed.
+ * Map the CLI's own model list (supportedModels) into the catalog. The
+ * context window of each id is the one the CLI reported now (`windows`); an
+ * id it could not answer this time keeps what it reported before (`previous`,
+ * the catalog in use), and an id it never answered gets 200K, which can only
+ * compact a chat early, never overflow it. Claude Code selects 1M through a
+ * `[1m]` suffix on the model id (the suffix never reaches the API); a model
+ * gets a second "(1M)" entry only when its `[1m]` variant runs a larger
+ * window than the plain id (Opus 4.6), and a refused variant is not listed.
  */
 export function modelsFromSdk(
   rows: SdkModelRow[],
   windows?: ReadonlyMap<string, number | null>,
+  previous: readonly ClaudeModel[] = [],
 ): ClaudeModel[] {
+  const before = (id: string) => previous.find((m) => m.id === id)?.contextWindow;
   const out: ClaudeModel[] = [];
   for (const row of rows) {
     // The concrete id, like t3code: a session stays on the model it picked
@@ -157,26 +149,16 @@ export function modelsFromSdk(
       modelNameFromId(row.resolvedModel) ??
       modelNameFromId(value) ??
       (row.displayName?.trim() || value);
-    const plain = windows?.get(base);
-    if (typeof plain === "number") {
-      out.push(model(base, name, limitFor(plain), undefined, efforts));
-      const extended = windows?.get(`${base}[1m]`);
-      if (typeof extended === "number" && extended > plain) {
-        out.push(model(`${base}[1m]`, `${name} (1M)`, limitFor(extended), undefined, efforts));
-      }
-      continue;
-    }
-    const rule = ONE_M_FAMILIES.find((f) => f.match.test(base));
-    if (rule?.mode === "fixed") {
-      out.push(model(base, name, LIMIT_1M, undefined, efforts));
-    } else if (rule?.mode === "optional") {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
-      out.push(model(`${base}[1m]`, `${name} (1M)`, LIMIT_1M, undefined, efforts));
-    } else if (/\[1m\]$/i.test(value)) {
-      // An unknown model the CLI itself lists as its 1M variant.
-      out.push(model(`${base}[1m]`, name, LIMIT_1M, undefined, efforts));
-    } else {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
+    const answered = windows?.get(base);
+    const plain = typeof answered === "number" ? answered : (before(base) ?? LIMIT_200K.context);
+    out.push(model(base, name, limitFor(plain), undefined, efforts));
+    // null: the CLI refused the variant for this account. Not answered this
+    // time: the variant stays if it was listed before, so a session on it
+    // keeps its model until the next refresh asks again.
+    const reported = windows?.get(`${base}[1m]`);
+    const extended = reported === undefined ? before(`${base}[1m]`) : reported;
+    if (typeof extended === "number" && extended > plain) {
+      out.push(model(`${base}[1m]`, `${name} (1M)`, limitFor(extended), undefined, efforts));
     }
   }
   // An alias row and its concrete row resolve to the same model.

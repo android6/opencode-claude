@@ -555,8 +555,8 @@ async function main() {
     assert.equal(row!.name, "Opus 5");
   }
 
-  // The CLI's own model list becomes the catalog; without the CLI's windows
-  // the family table decides
+  // The CLI's own model list becomes the catalog, with the windows the CLI
+  // reports for each id
   const cliRows = [
     { value: "default", displayName: "Default (recommended)", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
     { value: "opus", displayName: "Opus 5.5", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
@@ -606,20 +606,28 @@ async function main() {
     // CLAUDE_CODE_DISABLE_1M_CONTEXT=1: every id answers 200K
     const disabled = new Map([...windows].map(([id, w]) => [id, w === null ? null : 200_000]));
     assert.ok(modelsFromSdk(cliRows, disabled).every((m) => m.contextWindow === 200_000 && !m.id.endsWith("[1m]")));
-    // A model the CLI could not size falls back to the table
-    const partial = modelsFromSdk(cliRows, new Map([["claude-opus-5-5", 1_000_000]]));
+    // A model the CLI could not size this time keeps its last answer
+    const partial = modelsFromSdk(cliRows, new Map([["claude-opus-5-5", 1_000_000]]), probed);
     assert.equal(partial.find((m) => m.id === "claude-sonnet-5")!.contextWindow, 1_000_000);
+    assert.equal(partial.find((m) => m.id === "claude-opus-4-6")!.contextWindow, 200_000);
+    assert.ok(partial.some((m) => m.id === "claude-opus-4-6[1m]"), "a [1m] listed before stays");
+    // A model the CLI never answered for is listed at 200K: early compaction
+    // at worst, never an overflow
+    const never = modelsFromSdk(cliRows, new Map());
+    assert.ok(never.every((m) => m.contextWindow === 200_000 && !m.id.endsWith("[1m]")));
   }
   // Each window costs the CLI a model request, so only what is missing is asked
   {
     const { askMissingContextWindows } = await import("../src/query.ts");
     const asked: string[] = [];
-    const fakeCli = (answers: Record<string, number | null>) => {
+    const fakeCli = (answers: Record<string, number | null>, failure?: string) => {
       let current = "";
       return {
         setModel: async (id: string) => {
           asked.push(id);
-          if (typeof answers[id] !== "number") throw new Error("not available for your account");
+          if (typeof answers[id] !== "number") {
+            throw new Error(failure ?? "Sonnet with 1M context is not available for your account.");
+          }
           current = id;
         },
         getContextUsage: async () => ({ rawMaxTokens: answers[current], model: current }),
@@ -637,7 +645,8 @@ async function main() {
     asked.length = 0;
     assert.equal(await askMissingContextWindows(fakeCli(cliWindows) as any, cliRows, windows), false);
     assert.deepEqual(asked, []);
-    // A new model in the list: only it is asked
+    // Only the ids missing from the map are asked (dropping the whole cache
+    // for a new model is cacheForListedModels' call, tested below)
     const withFable = [...cliRows, { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1" }];
     await askMissingContextWindows(
       fakeCli({ ...cliWindows, "claude-fable-5-1": 1_000_000 }) as any,
@@ -651,6 +660,60 @@ async function main() {
     await askMissingContextWindows(fakeCli({}) as any, cliRows.slice(0, 2), failed);
     assert.equal(failed.size, 0);
     assert.deepEqual(asked, ["claude-opus-5-5"]);
+    // A [1m] variant that failed for another reason than access is not kept
+    // as a refusal: it would hide Opus 4.6 (1M) for a day
+    const plainOnly = Object.fromEntries(Object.entries(cliWindows).filter(([id]) => !id.endsWith("[1m]")));
+    const flaky = new Map<string, number | null>(Object.entries(plainOnly));
+    await askMissingContextWindows(
+      fakeCli(plainOnly, "Unable to validate model: fetch failed") as any,
+      cliRows,
+      flaky,
+    );
+    assert.equal(flaky.has("claude-opus-4-6[1m]"), false);
+    // The window question itself failing keeps what was already answered and
+    // stops the pass: it would fail for every model, each switch a request
+    const switched: string[] = [];
+    const brokenUsage = {
+      setModel: async (id: string) => {
+        switched.push(id);
+      },
+      getContextUsage: async () => {
+        throw new Error("get_context_usage is not supported in this context");
+      },
+    };
+    const kept = new Map<string, number | null>([["claude-opus-5-5", 1_000_000]]);
+    assert.equal(await askMissingContextWindows(brokenUsage as any, cliRows, kept), false);
+    assert.deepEqual([...kept], [["claude-opus-5-5", 1_000_000]]);
+    assert.deepEqual(switched, ["claude-sonnet-5"], "one switch, then the pass stops");
+  }
+  // A [1m] variant the CLI could not answer this time keeps its last answer;
+  // one it refused is not listed, even if it was listed before
+  {
+    const lastMenu = modelsFromSdk(cliRows, new Map(Object.entries({
+      ...cliWindows,
+      "claude-sonnet-4-6[1m]": 1_000_000,
+    })));
+    assert.ok(lastMenu.some((m) => m.id === "claude-sonnet-4-6[1m]"));
+    const unanswered = new Map<string, number | null>([
+      ["claude-opus-4-6", 200_000],
+      ["claude-sonnet-4-6", 200_000],
+      ["claude-sonnet-4-6[1m]", null],
+    ]);
+    const ids = modelsFromSdk(cliRows, unanswered, lastMenu).map((m) => m.id);
+    assert.ok(ids.includes("claude-opus-4-6[1m]"), "not answered: last answer");
+    assert.ok(!ids.includes("claude-sonnet-4-6[1m]"), "refused: not listed");
+  }
+  // Compaction sizes the transferred history to the model's window, also for
+  // a native 1M model without `[1m]` in its id
+  {
+    const { summaryHistoryMaxChars } = await import("../src/proxy.ts");
+    const { setDiscoveredModels } = await import("../src/models.ts");
+    setDiscoveredModels(modelsFromSdk(cliRows, new Map(Object.entries(cliWindows))));
+    assert.equal(summaryHistoryMaxChars("claude-opus-5-5"), 3_000_000);
+    assert.equal(summaryHistoryMaxChars("claude-opus-4-6"), 600_000);
+    assert.equal(summaryHistoryMaxChars("claude-opus-4-6[1m]"), 3_000_000);
+    assert.equal(summaryHistoryMaxChars("claude-unknown-9[1m]"), 3_000_000, "unlisted: by suffix");
+    assert.equal(summaryHistoryMaxChars("claude-unknown-9"), 600_000);
   }
   // The window cache holds while the CLI, the account and the 1M switch stay
   // the same, for a day at most
@@ -670,27 +733,67 @@ async function main() {
     assert.equal(cacheForListedModels(cache, models.slice(1)), cache, "a model gone is no reason");
     assert.equal(cacheForListedModels(cache, [...models, "claude-fable-5-1"]), null);
   }
-  // The 1M switch in Claude Code's settings.json joins the cache key
+  // Window variables in Claude Code's settings.json join the cache key
   {
-    const { settingsDisable1MContext } = await import("../src/query.ts");
-    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { settingsWindowVariables } = await import("../src/query.ts");
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const configDir = mkdtempSync(join(tmpdir(), "oc-claude-config-"));
-    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), undefined, "no settings.json");
-    writeFileSync(join(configDir, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" } }));
-    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), "1");
+    assert.deepEqual(settingsWindowVariables({ CLAUDE_CONFIG_DIR: configDir }), {}, "no settings.json");
+    writeFileSync(
+      join(configDir, "settings.json"),
+      JSON.stringify({
+        env: {
+          CLAUDE_CODE_DISABLE_1M_CONTEXT: "1",
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: 500000,
+          DISABLE_COMPACT: "1",
+          OTHER: "x",
+        },
+      }),
+    );
+    assert.deepEqual(settingsWindowVariables({ CLAUDE_CONFIG_DIR: configDir }), {
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: "1",
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "500000",
+      DISABLE_COMPACT: "1",
+    });
+    // Each thing the windows depend on changes the key
+    const { contextWindowKey } = await import("../src/query.ts");
+    const fakeInit = (version: string, subscriptionType: string) => ({
+      initializationResult: async () => ({
+        claude_code_version: version,
+        account: { email: "dev@example.com", organization: "org", subscriptionType, apiProvider: "firstParty" },
+      }),
+    });
+    const keyOf = (q: object, env: Record<string, string>) => contextWindowKey(q as any, env, undefined);
+    const plainEnv = { CLAUDE_CONFIG_DIR: join(configDir, "none") };
+    const base = await keyOf(fakeInit("2.1.300", "max"), plainEnv);
+    assert.equal(await keyOf(fakeInit("2.1.300", "max"), plainEnv), base, "nothing changed");
+    assert.notEqual(await keyOf(fakeInit("2.1.301", "max"), plainEnv), base, "CLI version");
+    assert.notEqual(await keyOf(fakeInit("2.1.300", "pro"), plainEnv), base, "plan");
+    assert.notEqual(
+      await keyOf(fakeInit("2.1.300", "max"), { ...plainEnv, CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" }),
+      base,
+      "1M switch in the environment",
+    );
+    assert.notEqual(
+      await keyOf(fakeInit("2.1.300", "max"), { CLAUDE_CONFIG_DIR: configDir }),
+      base,
+      "window variables in settings.json",
+    );
     writeFileSync(join(configDir, "settings.json"), "{ not json");
-    assert.equal(settingsDisable1MContext({ CLAUDE_CONFIG_DIR: configDir }), undefined, "unreadable file");
+    assert.deepEqual(settingsWindowVariables({ CLAUDE_CONFIG_DIR: configDir }), {}, "unreadable file");
+    rmSync(configDir, { recursive: true, force: true });
   }
   // A CLI update replaces the executable; CLIs before 2.1.300 do not report
   // their version, so the file stands for the build in the cache key
   {
     const { cliFileStamp } = await import("../src/query.ts");
-    const { mkdtempSync, writeFileSync, utimesSync } = await import("node:fs");
+    const { mkdtempSync, writeFileSync, utimesSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const exe = join(mkdtempSync(join(tmpdir(), "oc-claude-exe-")), "claude.exe");
+    const exeDir = mkdtempSync(join(tmpdir(), "oc-claude-exe-"));
+    const exe = join(exeDir, "claude.exe");
     writeFileSync(exe, "build 1");
     utimesSync(exe, new Date(2026, 9, 11), new Date(2026, 9, 11));
     const before = cliFileStamp(exe);
@@ -700,25 +803,24 @@ async function main() {
     assert.notEqual(cliFileStamp(exe), before, "an update changes the stamp");
     assert.equal(cliFileStamp(join(exe, "..", "missing.exe")), undefined);
     assert.equal(cliFileStamp(undefined), undefined, "the SDK's own CLI");
+    rmSync(exeDir, { recursive: true, force: true });
   }
   {
-    const fromCli = modelsFromSdk(cliRows);
+    const fromCli = modelsFromSdk(cliRows, new Map(Object.entries(cliWindows)));
     const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
     assert.deepEqual(
       fromCli.map((m) => m.id),
       [
         "claude-opus-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-6", "claude-opus-4-6[1m]",
-        "claude-sonnet-4-6", "claude-sonnet-4-6[1m]", "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
       ],
     );
-    assert.equal(byId["claude-opus-5-5"]!.contextWindow, 1_000_000);
     assert.equal(byId["claude-opus-5-5"]!.name, "Opus 5.5");
     assert.deepEqual(buildEffortVariants(byId["claude-opus-5-5"]!), ["low", "high"]);
-    assert.equal(byId["claude-sonnet-5"]!.contextWindow, 1_000_000);
-    assert.equal(byId["claude-opus-4-6"]!.contextWindow, 200_000);
     assert.equal(byId["claude-opus-4-6[1m]"]!.name, "Opus 4.6 (1M)");
-    assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
     assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
+    // The compaction check above already put this list in the catalog
+    assert.equal(setDiscoveredModels(modelsFromSdk(cliRows, new Map())), true);
     assert.equal(setDiscoveredModels(fromCli), true);
     const ids = getClaudeModels().map((m) => m.id);
     assert.ok(!ids.includes("fable"), "old aliases are not listed");

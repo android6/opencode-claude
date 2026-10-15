@@ -635,26 +635,42 @@ async function currentContextWindow(q: DiscoveryQuery): Promise<number | null> {
 }
 
 /**
- * CLAUDE_CODE_DISABLE_1M_CONTEXT as set in the user's Claude Code
- * settings.json `env`. Read on each model-list refresh, like the variable in
- * the environment; a change shows at the next refresh. The CLI also reports
- * its merged settings through `getSettings()` (SDK 0.3.300, not in the
- * SDK's public types), which covers organization-managed settings too; the
- * documented file is used instead.
+ * Variables that change the window Claude Code runs a model with: the 1M
+ * switch, and an assumed window, which applies to a model Claude Code knows
+ * only together with DISABLE_COMPACT (docs, model-config "Correct the window
+ * for a gateway or custom model ID").
  */
-export function settingsDisable1MContext(
+const WINDOW_VARIABLES = [
+  "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "DISABLE_COMPACT",
+] as const;
+
+/**
+ * WINDOW_VARIABLES as set in the user's Claude Code settings.json `env`.
+ * Read on each model-list refresh, like the variables in the environment; a
+ * change shows at the next refresh. The CLI also reports its merged settings
+ * through `getSettings()` (SDK 0.3.300, not in the SDK's public types), which
+ * covers organization-managed settings too; the documented file is used
+ * instead.
+ */
+export function settingsWindowVariables(
   env: Record<string, string | undefined>,
-): string | undefined {
+): Record<string, string> {
+  const found: Record<string, string> = {};
   try {
     const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
     const settings = JSON.parse(readFileSync(join(configDir, "settings.json"), "utf8")) as {
       env?: Record<string, unknown>;
     };
-    const value = settings?.env?.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-    return value === undefined || value === null ? undefined : String(value);
+    for (const name of WINDOW_VARIABLES) {
+      const value = settings?.env?.[name];
+      if (value !== undefined && value !== null) found[name] = String(value);
+    }
   } catch {
-    return undefined;
+    // No settings.json, or one Claude Code cannot read either.
   }
+  return found;
 }
 
 /**
@@ -676,9 +692,9 @@ export function cliFileStamp(executable: string | undefined): string | undefined
 
 /**
  * What the CLI's windows depend on besides the model id: the CLI build, the
- * account, and the 1M switch, in the environment and in settings.json.
+ * account, and WINDOW_VARIABLES, in the environment and in settings.json.
  */
-async function contextWindowKey(
+export async function contextWindowKey(
   q: DiscoveryQuery,
   env: Record<string, string | undefined>,
   executable: string | undefined,
@@ -695,27 +711,48 @@ async function contextWindowKey(
     account.organization,
     account.subscriptionType,
     account.apiProvider,
-    env.CLAUDE_CODE_DISABLE_1M_CONTEXT,
-    settingsDisable1MContext(env),
+    WINDOW_VARIABLES.map((name) => env[name]),
+    settingsWindowVariables(env),
   ];
   // A digest, so the cache file holds no email address.
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 16);
 }
 
 /**
- * Switch the idle query to `id` and read the window the CLI uses for it;
- * null when the CLI refuses the id ("Sonnet with 1M context is not available
- * for your account"), "timeout" when it stops answering.
+ * How the CLI words a model the account or plan cannot use: "Sonnet with 1M
+ * context is not available for your account", "The long context beta is not
+ * yet available for this subscription", "Model 'x' isn't available for your
+ * account". Any other failure (network, rate limit, a server error) says
+ * nothing about access.
+ */
+const ACCESS_REFUSED =
+  /(?:is not|isn't) (?:currently |yet )?available for (?:your account|this subscription)/i;
+
+/**
+ * Switch the idle query to `id` and read the window the CLI uses for it.
+ * "refused" when the CLI turns the id down for this account, "failed" when
+ * the switch fails otherwise, "unreadable" when the switch worked but the
+ * window question did not (then it fails for every model), "timeout" when
+ * the CLI stops answering.
  */
 async function askContextWindow(
   q: DiscoveryQuery,
   id: string,
-): Promise<number | null | "timeout"> {
+): Promise<number | "refused" | "failed" | "unreadable" | "timeout"> {
   const answer = await withTimeout(
-    q.setModel!(id).then(
-      () => currentContextWindow(q),
-      () => null,
-    ),
+    (async (): Promise<number | "refused" | "failed" | "unreadable"> => {
+      try {
+        await q.setModel!(id);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return ACCESS_REFUSED.test(message) ? "refused" : "failed";
+      }
+      try {
+        return (await currentContextWindow(q)) ?? "unreadable";
+      } catch {
+        return "unreadable";
+      }
+    })(),
     CONTEXT_PROBE_TIMEOUT_MS,
   );
   return answer ? answer.value : "timeout";
@@ -734,19 +771,25 @@ export async function askMissingContextWindows(
   windows: Map<string, number | null>,
 ): Promise<boolean> {
   let added = false;
+  // Every question costs a model request, so the pass stops as soon as the
+  // CLI stops answering or cannot report a window at all.
   for (const id of listedModelIds(rows)) {
     if (windows.has(id)) continue;
     const window = await askContextWindow(q, id);
-    if (window === "timeout") return added;
-    // A plain id that failed is asked again next time; the table covers it.
-    if (window === null) continue;
+    if (window === "timeout" || window === "unreadable") return added;
+    // A plain id without an answer is asked again next time; meanwhile it
+    // keeps the window the CLI reported before (see modelsFromSdk).
+    if (typeof window !== "number") continue;
     windows.set(id, window);
     added = true;
   }
   for (const id of extendedProbeIds(rows, windows)) {
     const window = await askContextWindow(q, id);
-    if (window === "timeout") return added;
-    windows.set(id, window);
+    if (window === "timeout" || window === "unreadable") return added;
+    // Only a refusal is kept (as null, so the variant is not listed); a
+    // failure is asked again next time.
+    if (window === "failed") continue;
+    windows.set(id, window === "refused" ? null : window);
     added = true;
   }
   return added;
@@ -795,19 +838,28 @@ export async function listClaudeSupportedModels(
     const rows = listed.value;
     const windows = new Map<string, number | null>();
     if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
-      const key = await contextWindowKey(q, env, pathToClaudeCodeExecutable ?? undefined);
-      const listed = listedModelIds(rows as SdkModelRow[]);
-      const cached = cacheForListedModels(readContextWindowCache(key), listed);
-      for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
-      // With a cache, only ids the CLI could not answer last time are asked.
-      if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
-        writeContextWindowCache({
-          key,
-          // The day starts over only when everything was asked.
-          savedAt: cached?.savedAt ?? Date.now(),
-          models: cached?.models ?? listed,
-          windows: Object.fromEntries(windows),
-        });
+      // The list stands on its own: a failure while asking windows keeps it
+      // and the windows already answered; the rest keep their last answer.
+      try {
+        const key = await contextWindowKey(q, env, pathToClaudeCodeExecutable ?? undefined);
+        const listed = listedModelIds(rows as SdkModelRow[]);
+        const cached = cacheForListedModels(readContextWindowCache(key), listed);
+        for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
+        // With a cache, only ids the CLI could not answer last time are asked.
+        if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
+          writeContextWindowCache({
+            key,
+            // The day starts over only when everything was asked.
+            savedAt: cached?.savedAt ?? Date.now(),
+            models: cached?.models ?? listed,
+            windows: Object.fromEntries(windows),
+          });
+        }
+      } catch (err) {
+        log.warn(
+          "[opencode-claude] could not read context windows from Claude Code",
+          err instanceof Error ? err.message : err,
+        );
       }
     }
     return { rows, windows };
