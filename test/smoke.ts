@@ -607,7 +607,7 @@ async function main() {
     const disabled = new Map([...windows].map(([id, w]) => [id, w === null ? null : 200_000]));
     assert.ok(modelsFromSdk(cliRows, disabled).every((m) => m.contextWindow === 200_000 && !m.id.endsWith("[1m]")));
     // A model the CLI could not size this time keeps its last answer
-    const partial = modelsFromSdk(cliRows, new Map([["claude-opus-5-5", 1_000_000]]), probed);
+    const partial = modelsFromSdk(cliRows, new Map([["claude-opus-5-5", 1_000_000]]), windows);
     assert.equal(partial.find((m) => m.id === "claude-sonnet-5")!.contextWindow, 1_000_000);
     assert.equal(partial.find((m) => m.id === "claude-opus-4-6")!.contextWindow, 200_000);
     assert.ok(partial.some((m) => m.id === "claude-opus-4-6[1m]"), "a [1m] listed before stays");
@@ -689,17 +689,16 @@ async function main() {
   // A [1m] variant the CLI could not answer this time keeps its last answer;
   // one it refused is not listed, even if it was listed before
   {
-    const lastMenu = modelsFromSdk(cliRows, new Map(Object.entries({
+    const lastAnswers = new Map(Object.entries({
       ...cliWindows,
       "claude-sonnet-4-6[1m]": 1_000_000,
-    })));
-    assert.ok(lastMenu.some((m) => m.id === "claude-sonnet-4-6[1m]"));
+    }));
     const unanswered = new Map<string, number | null>([
       ["claude-opus-4-6", 200_000],
       ["claude-sonnet-4-6", 200_000],
       ["claude-sonnet-4-6[1m]", null],
     ]);
-    const ids = modelsFromSdk(cliRows, unanswered, lastMenu).map((m) => m.id);
+    const ids = modelsFromSdk(cliRows, unanswered, lastAnswers).map((m) => m.id);
     assert.ok(ids.includes("claude-opus-4-6[1m]"), "not answered: last answer");
     assert.ok(!ids.includes("claude-sonnet-4-6[1m]"), "refused: not listed");
   }
@@ -732,6 +731,27 @@ async function main() {
     assert.equal(cacheForListedModels(cache, models), cache);
     assert.equal(cacheForListedModels(cache, models.slice(1)), cache, "a model gone is no reason");
     assert.equal(cacheForListedModels(cache, [...models, "claude-fable-5-1"]), null);
+    // The last answers stay readable whatever the key or age: they are what
+    // the CLI said, unlike the menu in models.json, which may hold a guess
+    const { readLastContextWindows } = await import("../src/models.ts");
+    assert.deepEqual(Object.fromEntries(readLastContextWindows()), cliWindows);
+  }
+  // With the 1M switch on, no [1m] variant can do better: none is asked
+  {
+    const { askMissingContextWindows, oneMillionContextDisabled } = await import("../src/query.ts");
+    const none = { CLAUDE_CONFIG_DIR: "/nonexistent-claude-config" };
+    assert.equal(oneMillionContextDisabled({ ...none, CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" }), true);
+    assert.equal(oneMillionContextDisabled({ ...none, CLAUDE_CODE_DISABLE_1M_CONTEXT: "0" }), false);
+    assert.equal(oneMillionContextDisabled(none), false);
+    const asked: string[] = [];
+    const all200k = {
+      setModel: async (id: string) => {
+        asked.push(id);
+      },
+      getContextUsage: async () => ({ rawMaxTokens: 200_000 }),
+    };
+    await askMissingContextWindows(all200k as any, cliRows, new Map(), { skipExtended: true });
+    assert.ok(asked.length > 0 && asked.every((id) => !id.endsWith("[1m]")));
   }
   // Window variables in Claude Code's settings.json join the cache key
   {
@@ -1313,6 +1333,25 @@ async function main() {
     ]));
     assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1[1m]"), "claude-opus-5");
     assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1"), "claude-opus-5");
+    // An explicit [1m] fallback stays; a plain one gets the 1M variant when
+    // the original ran at 1M, also a native 1M original without the suffix
+    setDiscoveredModels(modelsFromSdk(
+      [
+        { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1" },
+        { value: "claude-opus-4-6", resolvedModel: "claude-opus-4-6" },
+      ],
+      new Map<string, number | null>([
+        ["claude-fable-5-1", 1_000_000],
+        ["claude-opus-4-6", 200_000],
+        ["claude-opus-4-6[1m]", 1_000_000],
+      ]),
+    ));
+    assert.equal(catalogIdForFallback("claude-opus-4-6[1m]", "claude-fable-5-1"), "claude-opus-4-6[1m]");
+    assert.equal(catalogIdForFallback("claude-opus-4-6", "claude-fable-5-1"), "claude-opus-4-6[1m]");
+    setDiscoveredModels(modelsFromSdk([
+      { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1", supportedEffortLevels: ["low", "high"] },
+      { value: "claude-opus-5", resolvedModel: "claude-opus-5", supportedEffortLevels: ["low", "high"] },
+    ]));
     assert.match(
       modelFallbackNote({ original_model: "claude-fable-5-1", fallback_model: "claude-opus-5", api_refusal_category: "bio" }),
       /Fable 5\.1 declined this request \(bio\); Opus 5 answered/,

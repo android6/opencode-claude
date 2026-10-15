@@ -20,6 +20,7 @@ import {
   extendedProbeIds,
   listedModelIds,
   readContextWindowCache,
+  readLastContextWindows,
   writeContextWindowCache,
   type SdkModelRow,
 } from "./models.js";
@@ -588,6 +589,8 @@ export type ClaudeModelDiscovery = {
    * Ids missing here could not be asked (old CLI, timeout).
    */
   windows: Map<string, number | null>;
+  /** What the CLI reported before, for ids it could not answer now. */
+  lastAnswers: Map<string, number | null>;
 };
 
 async function withTimeout<T>(
@@ -671,6 +674,18 @@ export function settingsWindowVariables(
     // No settings.json, or one Claude Code cannot read either.
   }
   return found;
+}
+
+/**
+ * Whether CLAUDE_CODE_DISABLE_1M_CONTEXT is on, in the environment or in
+ * settings.json. Then every model runs at 200K and no `[1m]` variant can do
+ * better, so asking them would only spend model requests.
+ */
+export function oneMillionContextDisabled(env: Record<string, string | undefined>): boolean {
+  const value =
+    env.CLAUDE_CODE_DISABLE_1M_CONTEXT ??
+    settingsWindowVariables(env).CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  return value !== undefined && value !== "" && value !== "0" && value.toLowerCase() !== "false";
 }
 
 /**
@@ -769,6 +784,7 @@ export async function askMissingContextWindows(
   q: DiscoveryQuery,
   rows: SdkModelRow[],
   windows: Map<string, number | null>,
+  options: { skipExtended?: boolean } = {},
 ): Promise<boolean> {
   let added = false;
   // Every question costs a model request, so the pass stops as soon as the
@@ -783,6 +799,7 @@ export async function askMissingContextWindows(
     windows.set(id, window);
     added = true;
   }
+  if (options.skipExtended) return added;
   for (const id of extendedProbeIds(rows, windows)) {
     const window = await askContextWindow(q, id);
     if (window === "timeout" || window === "unreadable") return added;
@@ -837,6 +854,8 @@ export async function listClaudeSupportedModels(
     if (!listed) return null;
     const rows = listed.value;
     const windows = new Map<string, number | null>();
+    // Read before this pass can rewrite the cache.
+    const lastAnswers = readLastContextWindows();
     if (typeof q.setModel === "function" && typeof q.getContextUsage === "function") {
       // The list stands on its own: a failure while asking windows keeps it
       // and the windows already answered; the rest keep their last answer.
@@ -846,7 +865,10 @@ export async function listClaudeSupportedModels(
         const cached = cacheForListedModels(readContextWindowCache(key), listed);
         for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
         // With a cache, only ids the CLI could not answer last time are asked.
-        if (await askMissingContextWindows(q, rows as SdkModelRow[], windows)) {
+        const asked = await askMissingContextWindows(q, rows as SdkModelRow[], windows, {
+          skipExtended: oneMillionContextDisabled(env),
+        });
+        if (asked) {
           writeContextWindowCache({
             key,
             // The day starts over only when everything was asked.
@@ -862,7 +884,7 @@ export async function listClaudeSupportedModels(
         );
       }
     }
-    return { rows, windows };
+    return { rows, windows, lastAnswers };
   } finally {
     release();
     q.close?.();

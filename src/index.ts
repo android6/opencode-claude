@@ -125,7 +125,7 @@ async function refreshModelCatalog(reload: () => Promise<void>) {
     const found = await listClaudeSupportedModels();
     if (!found?.rows.length) return;
     // A window the CLI could not answer this time keeps its last answer.
-    const models = modelsFromSdk(found.rows as SdkModelRow[], found.windows, getClaudeModels());
+    const models = modelsFromSdk(found.rows as SdkModelRow[], found.windows, found.lastAnswers);
     if (setDiscoveredModels(models)) {
       await reload();
     }

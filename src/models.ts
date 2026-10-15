@@ -124,19 +124,23 @@ export function modelNameFromId(id: string | undefined): string | undefined {
 /**
  * Map the CLI's own model list (supportedModels) into the catalog. The
  * context window of each id is the one the CLI reported now (`windows`); an
- * id it could not answer this time keeps what it reported before (`previous`,
- * the catalog in use), and an id it never answered gets 200K, which can only
- * compact a chat early, never overflow it. Claude Code selects 1M through a
- * `[1m]` suffix on the model id (the suffix never reaches the API); a model
- * gets a second "(1M)" entry only when its `[1m]` variant runs a larger
- * window than the plain id (Opus 4.6), and a refused variant is not listed.
+ * id it could not answer this time keeps what it reported before
+ * (`lastAnswers`, from the window cache), and an id it never answered gets
+ * 200K, which can only compact a chat early, never overflow it. Claude Code
+ * selects 1M through a `[1m]` suffix on the model id (the suffix never
+ * reaches the API); a model gets a second "(1M)" entry only when its `[1m]`
+ * variant runs a larger window than the plain id (Opus 4.6), and a refused
+ * variant is not listed.
  */
 export function modelsFromSdk(
   rows: SdkModelRow[],
   windows?: ReadonlyMap<string, number | null>,
-  previous: readonly ClaudeModel[] = [],
+  lastAnswers?: ReadonlyMap<string, number | null>,
 ): ClaudeModel[] {
-  const before = (id: string) => previous.find((m) => m.id === id)?.contextWindow;
+  const answer = (id: string) => {
+    const now = windows?.get(id);
+    return now === undefined ? lastAnswers?.get(id) : now;
+  };
   const out: ClaudeModel[] = [];
   for (const row of rows) {
     // The concrete id, like t3code: a session stays on the model it picked
@@ -149,14 +153,13 @@ export function modelsFromSdk(
       modelNameFromId(row.resolvedModel) ??
       modelNameFromId(value) ??
       (row.displayName?.trim() || value);
-    const answered = windows?.get(base);
-    const plain = typeof answered === "number" ? answered : (before(base) ?? LIMIT_200K.context);
+    const answered = answer(base);
+    const plain = typeof answered === "number" ? answered : LIMIT_200K.context;
     out.push(model(base, name, limitFor(plain), undefined, efforts));
     // null: the CLI refused the variant for this account. Not answered this
-    // time: the variant stays if it was listed before, so a session on it
-    // keeps its model until the next refresh asks again.
-    const reported = windows?.get(`${base}[1m]`);
-    const extended = reported === undefined ? before(`${base}[1m]`) : reported;
+    // time: its last answer keeps the variant, so a session on it keeps its
+    // model until the next refresh asks again.
+    const extended = answer(`${base}[1m]`);
     if (typeof extended === "number" && extended > plain) {
       out.push(model(`${base}[1m]`, `${name} (1M)`, limitFor(extended), undefined, efforts));
     }
@@ -230,6 +233,26 @@ export function readContextWindowCache(
     return { key, savedAt: parsed.savedAt, models: parsed.models, windows: parsed.windows };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Every window the CLI ever reported and the cache still holds, whatever its
+ * key or age: the answer to fall back on when the CLI cannot answer now.
+ * Unlike the menu in models.json, it never holds a guess.
+ */
+export function readLastContextWindows(): Map<string, number | null> {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(dataFilePath("context-windows.json"), "utf8"),
+    ) as Partial<ContextWindowCache>;
+    const answers = new Map<string, number | null>();
+    for (const [id, window] of Object.entries(parsed.windows ?? {})) {
+      if (typeof window === "number" || window === null) answers.set(id, window);
+    }
+    return answers;
+  } catch {
+    return new Map();
   }
 }
 

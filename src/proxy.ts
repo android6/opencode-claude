@@ -746,11 +746,19 @@ export function setModelFallbackHandler(handler: ModelFallbackHandler | null): v
   modelFallbackHandler = handler;
 }
 
-/** Catalog id for the CLI's fallback model, keeping the 1M variant if picked. */
+/**
+ * Catalog id for the CLI's fallback model. A `[1m]` variant the CLI names
+ * explicitly stays as named. A plain name (the CLI usually reports the model
+ * without the suffix) gets the 1M variant when the original ran at 1M: by its
+ * window in the catalog, since a native 1M model has no `[1m]` in its id.
+ */
 export function catalogIdForFallback(fallback: string, original: string): string {
-  const ids = new Set(getClaudeModels().map((m) => m.id));
+  const models = getClaudeModels();
+  const ids = new Set(models.map((m) => m.id));
+  if (/\[1m\]$/i.test(fallback) && ids.has(fallback)) return fallback;
   const base = fallback.replace(/\[1m\]$/i, "");
-  const wants1M = /\[1m\]$/i.test(original);
+  const originalWindow = models.find((m) => m.id === original)?.contextWindow ?? 0;
+  const wants1M = /\[1m\]$/i.test(original) || originalWindow >= 1_000_000;
   for (const candidate of wants1M ? [`${base}[1m]`, base] : [base, `${base}[1m]`]) {
     if (ids.has(candidate)) return candidate;
   }
