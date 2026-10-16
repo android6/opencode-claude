@@ -535,6 +535,17 @@ async function discover() {
   rmSync(exeDir, { recursive: true, force: true });
 }
 
+// OpenCode imports a changed local plugin afresh on reload. The time of the
+// last catalog read is shared by every copy of the module, so a reload does
+// not start a second measuring pass within the ten minutes.
+{
+  const first = await import("../src/index.ts");
+  const reloaded = await import("../src/index.ts?reloaded");
+  assert.notEqual(first.ClaudeCodePlugin, reloaded.ClaudeCodePlugin, "a separate module copy");
+  first.modelRefreshRuntime.lastModelRefresh = 1234;
+  assert.equal(reloaded.modelRefreshRuntime.lastModelRefresh, 1234, "the reloaded copy sees the same time");
+}
+
 rmSync(dataDir, { recursive: true, force: true });
 rmSync(configDir, { recursive: true, force: true });
 console.log("context window regression ok");
