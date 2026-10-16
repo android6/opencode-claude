@@ -218,18 +218,7 @@ export function resolveClaudeCli(
     cachedResolution.key === key &&
     Date.now() < cachedResolution.expiresAt
   ) {
-    const { path } = cachedResolution;
-    if (!path) return Promise.resolve(null);
-    // Optional hardening, the maintainer's call: a memoized path can vanish
-    // under a running server when another process updates the CLI (an npm
-    // install's cli.js gives way to bin/claude.exe) or the user moves it.
-    // One stat per turn re-probes then, instead of spawning a missing file
-    // until the server restarts.
-    return isExecutableFile(path).then((present) => {
-      if (present) return path;
-      cachedResolution = null;
-      return resolveClaudeCli(env);
-    });
+    return Promise.resolve(cachedResolution.path);
   }
   if (inflight && inflight.key === key) return inflight.promise;
   const promise = probeClaudeCli(env).then(

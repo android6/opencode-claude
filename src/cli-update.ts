@@ -230,16 +230,29 @@ export function parseClaudeUpdateOutput(
   return null;
 }
 
-let updating = false;
 /**
- * Epoch ms of the last attempt whose record could not be written (read-only
- * data dir, full disk). Without it every plugin instance loaded after such
- * an attempt would find no record and run the update again.
+ * Kept on globalThis, like the bridge runtime (bridge-pool.ts): OpenCode
+ * imports a changed local plugin afresh on reload, and module-level flags
+ * would start over in each copy of this module within one server process.
  */
-let unrecordedAttemptAt = 0;
+type UpdateRuntime = {
+  updating: boolean;
+  /**
+   * Epoch ms of the last attempt whose record could not be written
+   * (read-only data dir, full disk). Without it every plugin instance loaded
+   * after such an attempt would find no fresh record and run the update again.
+   */
+  unrecordedAttemptAt: number;
+};
+
+const RUNTIME_KEY = Symbol.for("@openchamber/opencode-claude/cli-update-runtime/v1");
+
+const runtime: UpdateRuntime = ((globalThis as Record<symbol, unknown>)[
+  RUNTIME_KEY
+] ??= { updating: false, unrecordedAttemptAt: 0 }) as UpdateRuntime;
 
 export function isClaudeCliUpdateRunning(): boolean {
-  return updating;
+  return runtime.updating;
 }
 
 /** Run `claude update` once and report what it did. Never throws. */
@@ -253,8 +266,8 @@ export async function updateClaudeCli(options?: {
   /** Test seam for the `claude --version` check after the run. */
   probeVersion?: (binaryPath: string, env: Env) => Promise<string | null>;
 }): Promise<ClaudeCliUpdateOutcome> {
-  if (updating) return { kind: "busy" };
-  updating = true;
+  if (runtime.updating) return { kind: "busy" };
+  runtime.updating = true;
   try {
     const env = buildClaudeCodeChildEnv(options?.env ?? process.env);
     const binaryPath =
@@ -297,7 +310,7 @@ export async function updateClaudeCli(options?: {
     );
     return withInstalledVersion(outcome, installed);
   } finally {
-    updating = false;
+    runtime.updating = false;
   }
 }
 
@@ -407,8 +420,8 @@ function recordHoldsOff(record: ClaudeCliUpdateRecord, now: number, intervalMs: 
  * instances can still both start only if they read the record within the
  * same few milliseconds. The first check runs right away, so a server that
  * was idle for days catches up as soon as a plugin loads. Models of a new
- * version reach OpenCode the next time it loads the plugin, which is when
- * the catalog is read.
+ * version reach OpenCode the next time the catalog is read: at plugin load,
+ * at most once every ten minutes (refreshModelCatalog in index.ts).
  */
 export function startClaudeCliAutoUpdate(params: {
   options?: { cliAutoUpdate?: unknown };
@@ -431,19 +444,19 @@ export function startClaudeCliAutoUpdate(params: {
   let stopped = false;
 
   const tick = async () => {
-    if (stopped || updating) return;
+    if (stopped || runtime.updating) return;
     // No CLI yet (the install action may add one later): wait for the
     // next tick without recording anything.
     if (!(await cliPresent())) return;
     // Instances of one process share the CLI probe above and resume
     // together; the one that already started the update must not be
     // counted as "another Claude process" by the others.
-    if (stopped || updating) return;
+    if (stopped || runtime.updating) return;
     const record = readCliUpdateRecord(env);
     const now = Date.now();
     if (record && recordHoldsOff(record, now, intervalMs)) return;
     // Also over an old record that could not be replaced by the last claim.
-    if (now - unrecordedAttemptAt < intervalMs) return;
+    if (now - runtime.unrecordedAttemptAt < intervalMs) return;
     const at = new Date(now).toISOString();
     const claimed = writeCliUpdateRecord(
       { at, outcome: { kind: "running", pid: process.pid } },
@@ -452,7 +465,7 @@ export function startClaudeCliAutoUpdate(params: {
     // The record cannot be written (read-only data dir, full disk): the
     // attempt still counts within this process, and the outcome is not
     // written either, to warn about the record once.
-    if (!claimed) unrecordedAttemptAt = now;
+    if (!claimed) runtime.unrecordedAttemptAt = now;
     const outcome = await update();
     const attempt = { at, outcome };
     if (claimed) writeCliUpdateRecord(attempt, env);

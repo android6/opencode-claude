@@ -22,7 +22,7 @@
 import { EventEmitter } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { assert, sleep } from "./helpers.ts";
 
 // The plugin log follows the process's XDG_DATA_HOME: its warnings (the
@@ -425,33 +425,19 @@ async function main() {
       stopK2();
       assert.equal(stuckRuns, 1, "unreplaceable record: the second instance skips within the interval");
       assert.equal(readCliUpdateRecord(stuck)?.at, "2026-01-01T00:00:00.000Z", "the old record stayed");
+      // OpenCode imports a changed local plugin afresh on reload: a second
+      // copy of the module still knows about the attempt.
+      const reloaded = await import("../src/cli-update.ts?reloaded");
+      assert.notEqual(reloaded.startClaudeCliAutoUpdate, startClaudeCliAutoUpdate, "a separate module copy");
+      const stopK3 = reloaded.startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
+      await sleep(20);
+      stopK3();
+      assert.equal(stuckRuns, 1, "a reloaded module copy skips within the interval too");
     } finally {
       chmodSync(lock, process.platform === "win32" ? 0o644 : 0o755);
     }
   } finally {
     rmSync(data, { recursive: true, force: true });
-  }
-
-  // A memoized CLI path that vanished (another process updated the install)
-  // is re-probed instead of reused. Windows resolves by file presence alone,
-  // so a bare file stands in for the CLI; POSIX would probe it.
-  if (process.platform === "win32") {
-    const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import("../src/executable-path.ts");
-    const bin = mkdtempSync(join(tmpdir(), "opencode-claude-bin-"));
-    try {
-      const exe = join(bin, "claude.exe");
-      writeFileSync(exe, "");
-      const env = { PATH: bin, HOME: bin };
-      resetClaudeCliResolutionCache();
-      // The PATH walk joins with "/", so compare resolved paths.
-      assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
-      assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe, "memoized");
-      rmSync(exe);
-      assert.equal(await resolveClaudeCli(env), null, "vanished path is re-probed, not reused");
-    } finally {
-      resetClaudeCliResolutionCache();
-      rmSync(bin, { recursive: true, force: true });
-    }
   }
 
   console.log("ok — cli update regression passed");

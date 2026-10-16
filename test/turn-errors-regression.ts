@@ -8,12 +8,18 @@
  * - A meta request that hits its one-step limit says so plainly.
  * - Lost-session detection and dedupe with the SDK's iterator error keep
  *   working on the new text.
+ * - A CLI that did not start is a retryable 500 and drops the memoized CLI
+ *   path, so OpenCode's retry looks for the CLI again.
  *
  * Run: bun test/turn-errors-regression.ts
  */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   classifyClaudeFailure,
   failureStatusFor,
+  isClaudeLaunchFailure,
   resultErrorText,
   thrownErrorText,
 } from "../src/failure.ts";
@@ -141,6 +147,53 @@ async function main() {
       const res = await post("lost-chat", { stream: true, messages: [{ role: "user", content: "hi" }] });
       assert.equal(res.status, 500);
       assert.equal(getForeignSessionId("lost-chat"), undefined);
+    }
+
+    // The CLI did not start (launcher swapped by `claude update`, layout
+    // changed by an install): a 500 OpenCode retries, and the memoized CLI
+    // path is dropped so the retry looks again. Wordings of Agent SDK 0.3.x.
+    assert.ok(isClaudeLaunchFailure("Claude Code native binary not found at C:\\Users\\me\\.local\\bin\\claude.exe. Please ensure Claude Code is installed via native installer or specify a valid path with options.pathToClaudeCodeExecutable."));
+    assert.ok(isClaudeLaunchFailure("Claude Code executable not found at /opt/claude. Is options.pathToClaudeCodeExecutable set?"));
+    assert.ok(isClaudeLaunchFailure("Claude Code executable at /opt/claude exists but failed to launch."));
+    assert.ok(isClaudeLaunchFailure("Failed to spawn Claude Code process: spawn EBUSY"));
+    // Bun on Windows, launcher held open by another program: thrown at query().
+    assert.ok(isClaudeLaunchFailure("EBUSY: resource busy or locked, uv_spawn"));
+    assert.ok(isClaudeLaunchFailure("Claude Code executable path is not spawnable (ENOTDIR)."));
+    assert.ok(!isClaudeLaunchFailure("API Error: 500 boom"));
+    // Windows resolves by file presence alone, so a bare file stands in for
+    // the CLI; POSIX would run it.
+    if (process.platform === "win32") {
+      const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import("../src/executable-path.ts");
+      const bin = mkdtempSync(join(tmpdir(), "opencode-claude-bin-"));
+      try {
+        const exe = join(bin, "claude.exe");
+        writeFileSync(exe, "");
+        const env = { PATH: bin, HOME: bin };
+        resetClaudeCliResolutionCache();
+        // The PATH walk joins with "/", so compare resolved paths.
+        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
+        rmSync(exe);
+        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe, "memoized until a launch fails");
+        failWith([], `Claude Code native binary not found at ${exe}. Please ensure Claude Code is installed via native installer.`);
+        const res = await post("launch-failed", { stream: true, messages: [{ role: "user", content: "hi" }] });
+        assert.equal(res.status, 500, "a server error OpenCode retries");
+        assert.equal(await resolveClaudeCli(env), null, "the failed launch dropped the memoized path");
+
+        // A launcher locked at spawn throws before any stream: same 500, same reset.
+        writeFileSync(exe, "");
+        resetClaudeCliResolutionCache();
+        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
+        rmSync(exe);
+        proxy.setClaudeQueryStarter(async () => {
+          throw new Error("EBUSY: resource busy or locked, uv_spawn");
+        });
+        const thrown = await post("launch-locked", { stream: true, messages: [{ role: "user", content: "hi" }] });
+        assert.equal(thrown.status, 500, "a server error OpenCode retries");
+        assert.equal(await resolveClaudeCli(env), null, "the locked launch dropped the memoized path");
+      } finally {
+        resetClaudeCliResolutionCache();
+        rmSync(bin, { recursive: true, force: true });
+      }
     }
 
     // Mid-stream: the error shows once, without diagnostics.
