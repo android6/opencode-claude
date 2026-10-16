@@ -8,16 +8,19 @@
  * released since never show up. The plugin runs `claude update` for it: in
  * the background, once per interval across every server process on the
  * machine, with the outcome recorded next to models.json. The record is
- * claimed before `claude update` starts: Claude Code's own version lock only
- * makes a concurrent run wait and then report the same update, so without
- * the claim each OpenCode server downloads the release once more.
+ * claimed before `claude update` starts: Claude Code does not serialize
+ * concurrent updates (each run downloads into its own staging dir, and every
+ * one reports the update), so without the claim each OpenCode server
+ * downloads the release once more.
  *
  * `claude update` needs no terminal. It prints plain lines and exits 0 even
- * when it did nothing (another process held the version lock, or a package
+ * when it did nothing (another process held the update lock, or a package
  * manager owns the install), so the outcome is read from its output. It also
- * reports success when the new launcher could not be put in place (Windows,
- * the launcher held open by another program), so every run ends with
- * `claude --version`, and an outcome naming a version must match it.
+ * reports success when the new launcher could not be put in place: on
+ * Windows when another program holds claude.exe open, on every platform
+ * when ~/.local/bin/claude is not the installer's own launcher or its folder
+ * is not writable. So every run ends with `claude --version`, and an outcome
+ * naming a version must match it.
  *
  * Chat turns are not paused during an update. One that starts while the
  * launcher is being replaced fails to launch the CLI; proxy.ts answers it
@@ -190,17 +193,25 @@ function writeCliUpdateRecord(record: ClaudeCliUpdateRecord, env: Env): boolean 
   }
 }
 
+/** Advice `claude update` prints after a failure, not the failure itself. */
+const ADVICE_LINE = /^(?:Try\b|Possible causes|Please\b|Or\b|[•·*-])/;
+
 /**
  * `claude update` prints its progress first ("Current version: …",
- * "Checking for updates…") and the verdict last, so an error is on the last
- * non-empty line. A failed install ends with three lines instead:
+ * "Checking for updates…"), then the failure, then advice. The failure
+ * starts with "Error:" or "Failed to" and may go on for a line or two:
  *
  *   Error: Failed to install native update
  *   TelemetrySafeError: The connection dropped while downloading the update …
  *   Try running "claude doctor" for diagnostics
  *
- * The last one is only a hint; the cause is the lines between "Error:" and
- * it, so those are kept, joined into one line.
+ *   Failed to check for updates
+ *   Unable to fetch latest version from npm registry
+ *   Possible causes: …, Try: … (npm installs)
+ *
+ * So the lines from the first "Error:" / "Failed to" up to the first piece
+ * of advice are kept, joined into one line. Without such a line, the last
+ * line that is not advice is the verdict.
  */
 function failureMessage(text: string): string {
   const lines = text
@@ -208,29 +219,33 @@ function failureMessage(text: string): string {
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   if (lines.length === 0) return "";
-  const last = lines.length - 1;
-  if (!/Try running "claude doctor"/.test(lines[last]!)) return lines[last]!;
-  let errorLine = -1;
-  for (let i = last - 1; i >= 0; i--) {
-    if (lines[i]!.startsWith("Error:")) {
-      errorLine = i;
-      break;
-    }
+  const first = lines.findIndex((line) => /^(?:Error:|Failed to)/.test(line));
+  if (first < 0) {
+    const verdicts = lines.filter((line) => !ADVICE_LINE.test(line));
+    return verdicts[verdicts.length - 1] ?? lines[lines.length - 1]!;
   }
-  // No "Error:" line: the line before the hint is the best guess.
-  if (errorLine < 0) return lines[Math.max(0, last - 1)]!;
-  return lines.slice(errorLine, last).join(": ");
+  const kept: string[] = [];
+  for (const line of lines.slice(first)) {
+    if (kept.length > 0 && ADVICE_LINE.test(line)) break;
+    kept.push(line);
+  }
+  return kept.join(": ");
 }
 
-/** The lines `claude update` prints (Claude Code 2.1.280), by outcome. */
+/** The lines `claude update` prints (Claude Code 2.1.280–2.1.302), by outcome. */
 export function parseClaudeUpdateOutput(
   output: string,
 ): ClaudeCliUpdateOutcome | null {
-  const updated = /Successfully updated from (\S+) to version (\S+)/.exec(output);
+  // A channel or version cap below the installed version downgrades.
+  const updated = /Successfully (?:updated|downgraded) from (\S+) to version (\S+)/.exec(output);
   if (updated) return { kind: "updated", from: updated[1]!, to: updated[2]! };
   const current = /is up to date(?: \(([^)]+)\))?/.exec(output);
   if (current) return { kind: "up-to-date", version: current[1] ?? null };
-  if (/Another Claude process/.test(output)) return { kind: "busy" };
+  // Native installs, and npm installs ("Another instance is currently
+  // performing an update", exit 1).
+  if (/Another Claude process|Another instance is currently performing an update/.test(output)) {
+    return { kind: "busy" };
+  }
   if (/is managed by /.test(output)) return { kind: "package-manager" };
   return null;
 }
@@ -306,7 +321,15 @@ export async function updateClaudeCli(options?: {
       // instead of reusing the memoized path, and so does the check below.
       (options?.resetResolution ?? resetClaudeCliResolutionCache)();
       if (options?.binaryPath === undefined) {
-        checkedPath = (await resolveClaudeCli(env)) ?? binaryPath;
+        const found = await resolveClaudeCli(env);
+        if (found) {
+          checkedPath = found;
+        } else {
+          // The fresh binary missed its short detection probe (a slow first
+          // start): check the old path below, and drop the miss so the next
+          // turn looks again instead of handing the SDK no path for a minute.
+          (options?.resetResolution ?? resetClaudeCliResolutionCache)();
+        }
       }
     }
     const installed = await (options?.probeVersion ?? probeCliVersion)(
@@ -348,9 +371,8 @@ async function probeCliVersion(binaryPath: string, env: Env): Promise<string | n
 
 /**
  * An outcome that names the version the CLI should now be on must agree
- * with `claude --version`. On Windows `claude update` reports success when
- * it kept the old launcher (another program held it open during the swap);
- * the version check is what tells.
+ * with `claude --version`. `claude update` reports success when it kept the
+ * old launcher (see the top of this file); the version check is what tells.
  */
 function withInstalledVersion(
   outcome: ClaudeCliUpdateOutcome,
@@ -368,7 +390,7 @@ function withInstalledVersion(
   if (expected !== null && installed !== expected) {
     return {
       kind: "failed",
-      message: `${claim}, but \`claude --version\` reports ${installed ?? "no version"}`,
+      message: `${claim}, but \`claude --version\` reports ${installed ?? "no version"}; the launcher was not replaced (held open by another program, not the installer's own, or not writable)`,
       installed,
     };
   }

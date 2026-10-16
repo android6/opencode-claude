@@ -4,12 +4,14 @@
  *
  * It changes the installed CLI: installs an older version with
  * `claude install <from>`, takes the newest version out of
- * ~/.local/share/claude/versions so that every update downloads it again
+ * $XDG_DATA_HOME/claude/versions (~/.local/share/claude/versions by
+ * default) so that every update downloads it again
  * (one copy is kept beside that folder), and walks through the situations
  * below. It ends on the newest version: by `claude update`, or, if the
  * network is gone by then, by installing the kept copy. Native installs only
  * (`claude install <version>` and the versions folder exist only there; the
- * test refuses to run when the plugin resolves another `claude`); needs the
+ * test refuses to run when the plugin resolves another `claude`, or on macOS
+ * and Linux when ~/.local/bin/claude is not the installer's symlink); needs the
  * network; a few minutes, each download is the
  * whole ~270 MB binary. Stop running OpenCode servers first, or their own
  * hourly update may join in. On Windows each update leaves the replaced
@@ -31,12 +33,13 @@
  *
  * Verified on Windows 11 with Claude Code 2.1.300 -> 2.1.301. macOS and Linux
  * use the same commands (the launcher there is a symlink into the versions
- * folder), but have not been run.
+ * folder, replaced by an atomic rename, so situation 6 does not arise), but
+ * have not been run.
  *
  * Run: bun test/cli-update-live.ts --from <older version>   (e.g. --from 2.1.300)
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -49,7 +52,8 @@ const { resolveClaudeCli } = await import("../src/executable-path.ts");
 
 type Outcome = Awaited<ReturnType<typeof updateClaudeCli>>;
 
-const versionsDir = join(homedir(), ".local", "share", "claude", "versions");
+// Where the CLI keeps its versions: $XDG_DATA_HOME/claude, else ~/.local/share/claude.
+const versionsDir = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "claude", "versions");
 const doctorHint = /claude doctor/;
 
 /** Child mode for situation 5: one "server process" over the given data dir. */
@@ -100,6 +104,16 @@ const samePath = (a: string, b: string) =>
 if (!launcher || !samePath(launcher, nativeLauncher) || !existsSync(versionsDir)) {
   console.log(`Native Claude Code install not found: the plugin resolves ${launcher}, expected ${nativeLauncher} and ${versionsDir}.`);
   process.exit(2);
+}
+// macOS and Linux: the installer's launcher is a symlink into the versions
+// folder; it does not replace anything else (a copied binary, a wrapper).
+if (process.platform !== "win32") {
+  const isInstallerLink =
+    lstatSync(nativeLauncher).isSymbolicLink() && samePath(dirname(realpathSync(nativeLauncher)), realpathSync(versionsDir));
+  if (!isInstallerLink) {
+    console.log(`${nativeLauncher} is not the installer's symlink into ${versionsDir}; claude update would not replace it.`);
+    process.exit(2);
+  }
 }
 
 /** Run the launcher directly, as a user would. */

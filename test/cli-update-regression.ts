@@ -165,26 +165,52 @@ async function main() {
     const hintOnly = await run(`${preamble}disk full\nTry running "claude doctor" for diagnostics\n`, 1);
     assert.equal(hintOnly.outcome.kind === "failed" && hintOnly.outcome.message, "disk full");
 
-    // "Successfully updated" while the old launcher stays (Windows, launcher
-    // held open during the swap): the version check turns it into a failure.
+    // "Successfully updated" while the old launcher stays (held open on
+    // Windows; on any platform not the installer's own, or not writable):
+    // the version check turns it into a failure.
     const kept = await run(`${preamble}Successfully updated from 2.1.280 to version 2.1.296\n`, 0, "/opt/claude", "normal", "2.1.280");
+    const notReplaced = "; the launcher was not replaced (held open by another program, not the installer's own, or not writable)";
     assert.deepEqual(kept.outcome, {
       kind: "failed",
-      message: "claude update reported 2.1.280 -> 2.1.296, but `claude --version` reports 2.1.280",
+      message: `claude update reported 2.1.280 -> 2.1.296, but \`claude --version\` reports 2.1.280${notReplaced}`,
       installed: "2.1.280",
     });
     const noAnswer = await run(`${preamble}Successfully updated from 2.1.280 to version 2.1.296\n`, 0, "/opt/claude", "normal", null);
     assert.deepEqual(noAnswer.outcome, {
       kind: "failed",
-      message: "claude update reported 2.1.280 -> 2.1.296, but `claude --version` reports no version",
+      message: `claude update reported 2.1.280 -> 2.1.296, but \`claude --version\` reports no version${notReplaced}`,
       installed: null,
     });
     const staleCurrent = await run(`${preamble}Claude Code is up to date (2.1.296)\n`, 0, "/opt/claude", "normal", "2.1.280");
     assert.deepEqual(staleCurrent.outcome, {
       kind: "failed",
-      message: "claude update reported 2.1.296 as up to date, but `claude --version` reports 2.1.280",
+      message: `claude update reported 2.1.296 as up to date, but \`claude --version\` reports 2.1.280${notReplaced}`,
       installed: "2.1.280",
     });
+
+    // npm installs print the cause first and advice after it (Claude Code 2.1.302).
+    const npmOffline = await run(
+      `${preamble}Failed to check for updates\nUnable to fetch latest version from npm registry\n\nPossible causes:\n  • Network connectivity issues\n  • npm registry is unreachable\n\nTry:\n  • Check your internet connection\n  • Check if you need to login: npm whoami\n`,
+      1,
+    );
+    assert.equal(
+      npmOffline.outcome.kind === "failed" && npmOffline.outcome.message,
+      "Failed to check for updates: Unable to fetch latest version from npm registry",
+    );
+    const npmPermissions = await run(
+      `${preamble}Error: Insufficient permissions to install update.\nTry manually updating with:\n  cd ~/.claude/local && npm update @anthropic-ai/claude-code\nTry running with sudo or fix npm permissions\n`,
+      1,
+    );
+    assert.equal(
+      npmPermissions.outcome.kind === "failed" && npmPermissions.outcome.message,
+      "Error: Insufficient permissions to install update.",
+    );
+    // npm's "update in progress" is the same busy as the native lock.
+    const npmBusy = await run(`${preamble}Error: Another instance is currently performing an update.\nPlease wait and try again later.\n`, 1);
+    assert.equal(npmBusy.outcome.kind, "busy");
+    // A channel or version cap below the installed version downgrades.
+    const downgraded = await run(`${preamble}Successfully downgraded from 2.1.302 to version 2.1.296\n`, 0);
+    assert.deepEqual(downgraded.outcome, { kind: "updated", from: "2.1.302", to: "2.1.296", installed: "2.1.296" });
 
     // Exit 0 with unknown text is not a success either.
     const unknown = await run(`${preamble}something new\n`, 0);
@@ -403,38 +429,41 @@ async function main() {
 
     // An old record that is still readable but can no longer be replaced
     // (read-only file on Windows, read-only dir elsewhere): the in-memory
-    // count holds the next instance off as well.
-    await sleep(250);
-    const stuck = { XDG_DATA_HOME: join(data, "stuck"), OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS: "200" };
-    const stuckFile = cliUpdateRecordPath(stuck);
-    mkdirSync(dirname(stuckFile), { recursive: true });
-    writeFileSync(stuckFile, JSON.stringify({ at: "2026-01-01T00:00:00.000Z", outcome: { kind: "up-to-date", version: "2.1.280" } }));
-    const lock = process.platform === "win32" ? stuckFile : dirname(stuckFile);
-    chmodSync(lock, process.platform === "win32" ? 0o444 : 0o555);
-    try {
-      let stuckRuns = 0;
-      const stuckUpdate = async () => {
-        stuckRuns += 1;
-        return { kind: "up-to-date" as const, version: "2.1.296" };
-      };
-      const stopK1 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
-      await sleep(20);
-      const stopK2 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
-      await sleep(20);
-      stopK1();
-      stopK2();
-      assert.equal(stuckRuns, 1, "unreplaceable record: the second instance skips within the interval");
-      assert.equal(readCliUpdateRecord(stuck)?.at, "2026-01-01T00:00:00.000Z", "the old record stayed");
-      // OpenCode imports a changed local plugin afresh on reload: a second
-      // copy of the module still knows about the attempt.
-      const reloaded = await import("../src/cli-update.ts?reloaded");
-      assert.notEqual(reloaded.startClaudeCliAutoUpdate, startClaudeCliAutoUpdate, "a separate module copy");
-      const stopK3 = reloaded.startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
-      await sleep(20);
-      stopK3();
-      assert.equal(stuckRuns, 1, "a reloaded module copy skips within the interval too");
-    } finally {
-      chmodSync(lock, process.platform === "win32" ? 0o644 : 0o755);
+    // count holds the next instance off as well. Root ignores the read-only
+    // dir, so the case cannot be set up there (CI containers).
+    if (process.getuid?.() !== 0) {
+      await sleep(250);
+      const stuck = { XDG_DATA_HOME: join(data, "stuck"), OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS: "200" };
+      const stuckFile = cliUpdateRecordPath(stuck);
+      mkdirSync(dirname(stuckFile), { recursive: true });
+      writeFileSync(stuckFile, JSON.stringify({ at: "2026-01-01T00:00:00.000Z", outcome: { kind: "up-to-date", version: "2.1.280" } }));
+      const lock = process.platform === "win32" ? stuckFile : dirname(stuckFile);
+      chmodSync(lock, process.platform === "win32" ? 0o444 : 0o555);
+      try {
+        let stuckRuns = 0;
+        const stuckUpdate = async () => {
+          stuckRuns += 1;
+          return { kind: "up-to-date" as const, version: "2.1.296" };
+        };
+        const stopK1 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
+        await sleep(20);
+        const stopK2 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
+        await sleep(20);
+        stopK1();
+        stopK2();
+        assert.equal(stuckRuns, 1, "unreplaceable record: the second instance skips within the interval");
+        assert.equal(readCliUpdateRecord(stuck)?.at, "2026-01-01T00:00:00.000Z", "the old record stayed");
+        // OpenCode imports a changed local plugin afresh on reload: a second
+        // copy of the module still knows about the attempt.
+        const reloaded = await import("../src/cli-update.ts?reloaded");
+        assert.notEqual(reloaded.startClaudeCliAutoUpdate, startClaudeCliAutoUpdate, "a separate module copy");
+        const stopK3 = reloaded.startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
+        await sleep(20);
+        stopK3();
+        assert.equal(stuckRuns, 1, "a reloaded module copy skips within the interval too");
+      } finally {
+        chmodSync(lock, process.platform === "win32" ? 0o644 : 0o755);
+      }
     }
   } finally {
     rmSync(data, { recursive: true, force: true });

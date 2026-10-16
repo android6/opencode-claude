@@ -13,7 +13,7 @@
  *
  * Run: bun test/turn-errors-regression.ts
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -156,40 +156,53 @@ async function main() {
     assert.ok(isClaudeLaunchFailure("Claude Code executable not found at /opt/claude. Is options.pathToClaudeCodeExecutable set?"));
     assert.ok(isClaudeLaunchFailure("Claude Code executable at /opt/claude exists but failed to launch."));
     assert.ok(isClaudeLaunchFailure("Failed to spawn Claude Code process: spawn EBUSY"));
-    // Bun on Windows, launcher held open by another program: thrown at query().
+    // Bun throws other spawn errors at query(), naming the system call:
+    // Windows (launcher held open by another program), then POSIX.
     assert.ok(isClaudeLaunchFailure("EBUSY: resource busy or locked, uv_spawn"));
+    assert.ok(isClaudeLaunchFailure("ETXTBSY: text file busy, posix_spawn"));
     assert.ok(isClaudeLaunchFailure("Claude Code executable path is not spawnable (ENOTDIR)."));
     assert.ok(!isClaudeLaunchFailure("API Error: 500 boom"));
-    // Windows resolves by file presence alone, so a bare file stands in for
-    // the CLI; POSIX would run it.
-    if (process.platform === "win32") {
+    {
       const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import("../src/executable-path.ts");
       const bin = mkdtempSync(join(tmpdir(), "opencode-claude-bin-"));
+      // Windows resolves by file presence alone, so a bare file stands in for
+      // the CLI; POSIX runs `claude --version`, so a script answers it.
+      const exe = join(bin, process.platform === "win32" ? "claude.exe" : "claude");
+      const placeCli = () => {
+        if (process.platform === "win32") {
+          writeFileSync(exe, "");
+        } else {
+          writeFileSync(exe, "#!/bin/sh\necho 9.9.9\n");
+          chmodSync(exe, 0o755);
+        }
+      };
+      // The PATH walk joins with "/", so compare resolved paths.
+      const resolved = async () => resolve((await resolveClaudeCli(env)) ?? "");
+      const env = { PATH: bin, HOME: bin };
       try {
-        const exe = join(bin, "claude.exe");
-        writeFileSync(exe, "");
-        const env = { PATH: bin, HOME: bin };
+        placeCli();
         resetClaudeCliResolutionCache();
-        // The PATH walk joins with "/", so compare resolved paths.
-        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
+        assert.equal(await resolved(), exe);
         rmSync(exe);
-        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe, "memoized until a launch fails");
+        assert.equal(await resolved(), exe, "memoized until a launch fails");
         failWith([], `Claude Code native binary not found at ${exe}. Please ensure Claude Code is installed via native installer.`);
         const res = await post("launch-failed", { stream: true, messages: [{ role: "user", content: "hi" }] });
         assert.equal(res.status, 500, "a server error OpenCode retries");
-        assert.equal(await resolveClaudeCli(env), null, "the failed launch dropped the memoized path");
+        // Looked for again. (On POSIX the search also asks the real npm for
+        // its global bin, which may hold a `claude` of its own.)
+        assert.notEqual(await resolved(), exe, "the failed launch dropped the memoized path");
 
         // A launcher locked at spawn throws before any stream: same 500, same reset.
-        writeFileSync(exe, "");
+        placeCli();
         resetClaudeCliResolutionCache();
-        assert.equal(resolve((await resolveClaudeCli(env)) ?? ""), exe);
+        assert.equal(await resolved(), exe);
         rmSync(exe);
         proxy.setClaudeQueryStarter(async () => {
           throw new Error("EBUSY: resource busy or locked, uv_spawn");
         });
         const thrown = await post("launch-locked", { stream: true, messages: [{ role: "user", content: "hi" }] });
         assert.equal(thrown.status, 500, "a server error OpenCode retries");
-        assert.equal(await resolveClaudeCli(env), null, "the locked launch dropped the memoized path");
+        assert.notEqual(await resolved(), exe, "the locked launch dropped the memoized path");
       } finally {
         resetClaudeCliResolutionCache();
         rmSync(bin, { recursive: true, force: true });
