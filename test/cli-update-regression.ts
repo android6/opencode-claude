@@ -264,6 +264,12 @@ async function main() {
     const env = { XDG_DATA_HOME: data, OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS: "200" };
     assert.equal(readCliUpdateRecord(env), null);
     const cliPresent = async () => true;
+    // What should happen is awaited, up to a second: under load a tick can
+    // take longer than a fixed pause. What should not happen gets a pause.
+    const waitFor = async (done: () => boolean) => {
+      const deadline = Date.now() + 1000;
+      while (!done() && Date.now() < deadline) await sleep(5);
+    };
 
     let runs = 0;
     const update = async () => {
@@ -279,14 +285,14 @@ async function main() {
     assert.equal(runs, 0, "no CLI: no update attempt");
     assert.equal(readCliUpdateRecord(env), null, "no CLI: no record");
     present = true;
-    await sleep(300);
+    await waitFor(() => runs >= 1);
     stopMissing();
     assert.ok(runs >= 1, "installed later: the next tick runs the update");
     runs = 0;
     rmSync(cliUpdateRecordPath(env), { force: true });
 
     const stopA = startClaudeCliAutoUpdate({ env, update, cliPresent });
-    await sleep(20);
+    await waitFor(() => readCliUpdateRecord(env)?.outcome.kind === "up-to-date");
     assert.equal(runs, 1, "first check runs at once");
     const record = readCliUpdateRecord(env);
     assert.equal(record?.outcome.kind, "up-to-date");
@@ -300,6 +306,7 @@ async function main() {
 
     // After the interval the timer runs the check again.
     await sleep(400);
+    await waitFor(() => runs >= 2);
     assert.ok(runs >= 2 && runs <= 4, `timer re-ran the check (${runs} runs)`);
     stopA();
     const afterStop = runs;
@@ -313,7 +320,7 @@ async function main() {
       cliPresent,
       update: async () => ({ kind: "updated" as const, from: "2.1.280", to: "2.1.296" }),
     });
-    await sleep(20);
+    await waitFor(() => readCliUpdateRecord(env)?.outcome.kind === "updated");
     stopC();
     assert.deepEqual(readCliUpdateRecord(env)?.outcome, {
       kind: "updated",
@@ -332,7 +339,8 @@ async function main() {
       cliPresent,
       update: async () => ({ kind: "failed" as const, message: "Error: Failed to install native update: offline", installed: "2.1.280" }),
     });
-    await sleep(20);
+    // The record and the history line are written together.
+    await waitFor(() => readCliUpdateRecord(env)?.outcome.kind === "failed");
     stopF();
     const failedLine = readFileSync(cliUpdateLogPath(env), "utf8").trim().split("\n").at(-1)!;
     assert.match(failedLine, /Z failed \(CLI 2\.1\.280\): Error: Failed to install native update: offline$/);
@@ -349,7 +357,7 @@ async function main() {
       });
     };
     const stopS1 = startClaudeCliAutoUpdate({ env, cliPresent, update: slowUpdate });
-    await sleep(20);
+    await waitFor(() => readCliUpdateRecord(env)?.outcome.kind === "running");
     assert.deepEqual(readCliUpdateRecord(env)?.outcome, { kind: "running", pid: process.pid });
     // Longer than the 200 ms interval: the claim holds for a whole run.
     await sleep(300);
@@ -357,9 +365,7 @@ async function main() {
     await sleep(20);
     assert.equal(slowRuns, 1, "a running claim keeps other instances off");
     release();
-    // Under load the outcome can take longer than a fixed pause: wait for it.
-    const deadline = Date.now() + 1000;
-    while (readCliUpdateRecord(env)?.outcome.kind === "running" && Date.now() < deadline) await sleep(10);
+    await waitFor(() => readCliUpdateRecord(env)?.outcome.kind !== "running");
     assert.equal(readCliUpdateRecord(env)?.outcome.kind, "up-to-date", "the outcome replaces the claim");
     stopS1();
     stopS2();
@@ -383,7 +389,7 @@ async function main() {
     assert.equal(claimRuns, 0, "a minute-old claim still holds");
     claimAt(12 * 60_000);
     const stopC2 = startClaudeCliAutoUpdate({ env, cliPresent, update: countUpdate });
-    await sleep(20);
+    await waitFor(() => claimRuns === 1);
     stopC2();
     assert.equal(claimRuns, 1, "an abandoned claim expires");
 
@@ -415,7 +421,7 @@ async function main() {
       return { kind: "up-to-date" as const, version: "2.1.296" };
     };
     const stopU1 = startClaudeCliAutoUpdate({ env: unwritable, cliPresent, update: unrecordedUpdate });
-    await sleep(20);
+    await waitFor(() => unrecordedRuns === 1);
     assert.equal(unrecordedRuns, 1, "unwritable record: first instance runs");
     assert.equal(readCliUpdateRecord(unwritable), null, "unwritable record: nothing on disk");
     const stopU2 = startClaudeCliAutoUpdate({ env: unwritable, cliPresent, update: unrecordedUpdate });
@@ -448,7 +454,7 @@ async function main() {
           return { kind: "up-to-date" as const, version: "2.1.296" };
         };
         const stopK1 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
-        await sleep(20);
+        await waitFor(() => stuckRuns === 1);
         const stopK2 = startClaudeCliAutoUpdate({ env: stuck, cliPresent, update: stuckUpdate });
         await sleep(20);
         stopK1();
