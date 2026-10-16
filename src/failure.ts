@@ -13,6 +13,15 @@
  * - refusal          → 400 refusal (Claude declined; a retry is refused too)
  * - overloaded       → 503 overloaded_error (retryable; OpenCode backs off)
  * - unknown          → 500
+ *
+ * Retries are OpenCode's, not ours: it treats any 5xx from a provider as
+ * ProviderInternal and repeats the request up to 10 times, 2, 4, 8, then
+ * 10 s apart (packages/ai/src/provider-error.ts, classifyProviderFailure;
+ * packages/core/src/session/runner/retry.ts). A CLI that did not start
+ * (isClaudeLaunchFailure) relies on that: the turn is a plain 500, the
+ * memoized CLI path is dropped, and the retry finds the CLI again. Checked
+ * live on Windows with the launcher held open for 15 s: three 500s, then
+ * the fourth attempt answered.
  */
 import { isClaudeRateLimitText } from "./rate-limit.js";
 

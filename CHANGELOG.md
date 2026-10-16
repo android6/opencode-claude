@@ -12,6 +12,11 @@
   `cliAutoUpdate: false` in the plugin options or Claude Code's
   `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`.
+- **A CLI that does not start is looked for again**: when a turn cannot
+  launch the CLI (an update is replacing it, an install changed its path,
+  another program holds the file), the plugin forgets the path it had found
+  and answers with a server error; OpenCode retries it a few seconds later
+  and the retry finds the CLI anew.
 
 ## 1.4.0 - 2026-10-11
 

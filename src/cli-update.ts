@@ -18,6 +18,11 @@
  * reports success when the new launcher could not be put in place (Windows,
  * the launcher held open by another program), so every run ends with
  * `claude --version`, and an outcome naming a version must match it.
+ *
+ * Chat turns are not paused during an update. One that starts while the
+ * launcher is being replaced fails to launch the CLI; proxy.ts answers it
+ * with a 500 and drops the memoized CLI path, and OpenCode's own retry of
+ * 5xx answers finds the new CLI (see failure.ts).
  */
 import { spawn } from "node:child_process";
 import {
