@@ -1,14 +1,12 @@
 /**
  * Claude Code model catalog (from OpenChamber harness registry).
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import {
   EFFORT_LEVELS,
   isClaudeEffort,
   type ClaudeEffort,
 } from "./constants.js";
+import { readCachedModels, writeCachedModels } from "./model-cache.js";
 
 export type ClaudeModel = {
   id: string;
@@ -186,119 +184,6 @@ export function setDiscoveredModels(models: ClaudeModel[]): boolean {
   discovered = models;
   if (changed) writeCachedModels(models);
   return changed;
-}
-
-function dataFilePath(name: string): string {
-  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", name);
-}
-
-function modelCachePath(): string {
-  return dataFilePath("models.json");
-}
-
-/**
- * Context windows the CLI reported, by model id; null means the CLI refused
- * the id (a `[1m]` variant the plan does not include). Asking costs a model
- * request per id (`setModel` checks a new model with a one-token call), so
- * answers are kept while `key` stays the same (CLI version, account, the
- * 1M switch) and the CLI lists no new model, and for a day at most: the day
- * also catches what Anthropic changes on its side without a new CLI, such
- * as 1M access for the account.
- */
-export type ContextWindowCache = {
-  key: string;
-  savedAt: number;
-  /** The listed models the windows were taken for. */
-  models: string[];
-  windows: Record<string, number | null>;
-};
-
-const CONTEXT_WINDOW_CACHE_TTL_MS = 24 * 60 * 60_000;
-
-/** The stored windows if they were taken under `key` less than a day ago. */
-export function readContextWindowCache(
-  key: string,
-  now = Date.now(),
-): ContextWindowCache | null {
-  try {
-    const parsed = JSON.parse(
-      readFileSync(dataFilePath("context-windows.json"), "utf8"),
-    ) as Partial<ContextWindowCache>;
-    if (parsed.key !== key || typeof parsed.savedAt !== "number") return null;
-    // A savedAt in the future means the clock moved back: ask again.
-    if (parsed.savedAt > now || now - parsed.savedAt >= CONTEXT_WINDOW_CACHE_TTL_MS) return null;
-    if (!parsed.windows || typeof parsed.windows !== "object") return null;
-    if (!Array.isArray(parsed.models)) return null;
-    return { key, savedAt: parsed.savedAt, models: parsed.models, windows: parsed.windows };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Every window the CLI ever reported and the cache still holds, whatever its
- * key or age: the answer to fall back on when the CLI cannot answer now.
- * Unlike the menu in models.json, it never holds a guess.
- */
-export function readLastContextWindows(): Map<string, number | null> {
-  try {
-    const parsed = JSON.parse(
-      readFileSync(dataFilePath("context-windows.json"), "utf8"),
-    ) as Partial<ContextWindowCache>;
-    const answers = new Map<string, number | null>();
-    for (const [id, window] of Object.entries(parsed.windows ?? {})) {
-      if (typeof window === "number" || window === null) answers.set(id, window);
-    }
-    return answers;
-  } catch {
-    return new Map();
-  }
-}
-
-/**
- * The cache, or null when the CLI lists a model it was not taken for. A new
- * model can come with changes to the others (a CLI or catalog update), so
- * everything is asked again rather than the new model alone.
- */
-export function cacheForListedModels(
-  cache: ContextWindowCache | null,
-  listed: string[],
-): ContextWindowCache | null {
-  if (!cache) return null;
-  return listed.every((id) => cache.models.includes(id)) ? cache : null;
-}
-
-export function writeContextWindowCache(cache: ContextWindowCache): void {
-  try {
-    const file = dataFilePath("context-windows.json");
-    mkdirSync(dirname(file), { recursive: true });
-    // Whole file or nothing: two OpenCode servers can write it at once.
-    const temp = `${file}.${process.pid}.tmp`;
-    writeFileSync(temp, JSON.stringify(cache, null, 2));
-    renameSync(temp, file);
-  } catch {
-    // Without the file the windows are asked again next time.
-  }
-}
-
-function readCachedModels(): ClaudeModel[] | null {
-  try {
-    const parsed = JSON.parse(readFileSync(modelCachePath(), "utf8"));
-    return Array.isArray(parsed) && parsed.length ? (parsed as ClaudeModel[]) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedModels(models: ClaudeModel[]): void {
-  try {
-    const file = modelCachePath();
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(models, null, 2));
-  } catch {
-    // The cache only speeds up the next start.
-  }
 }
 
 export function resolveClaudeModelId(modelId: string): string {

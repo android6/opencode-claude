@@ -36,9 +36,8 @@ import {
   modelsFromSdk,
   setDiscoveredModels,
   type ClaudeModel,
-  type SdkModelRow,
 } from "./models.js";
-import { listClaudeSupportedModels } from "./query.js";
+import { listClaudeSupportedModels } from "./model-discovery.js";
 import { closeSessionBridges } from "./bridge-pool.js";
 import {
   getClaudeProxyBaseUrl,
@@ -125,7 +124,7 @@ async function refreshModelCatalog(reload: () => Promise<void>) {
     const found = await listClaudeSupportedModels();
     if (!found?.rows.length) return;
     // A window the CLI could not answer this time keeps its last answer.
-    const models = modelsFromSdk(found.rows as SdkModelRow[], found.windows, found.lastAnswers);
+    const models = modelsFromSdk(found.rows, found.windows, found.lastAnswers);
     if (setDiscoveredModels(models)) {
       await reload();
     }
