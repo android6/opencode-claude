@@ -104,8 +104,8 @@ function envBoolean(value: string | undefined): boolean {
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, which the CLI reads by presence
  * (any non-empty value, even `0`) and which stops its own background
  * updates; `claude update` would not check it, so the plugin must. (The CLI
- * also reads them from the `env` block of its settings.json, which the
- * plugin cannot see; `claude update` itself honours DISABLE_UPDATES there.)
+ * also reads them from the `env` block of its settings.json, which this
+ * check does not read; `claude update` itself honours DISABLE_UPDATES there.)
  */
 export function cliAutoUpdateDisabledReason(
   options: { cliAutoUpdate?: unknown } | undefined,
