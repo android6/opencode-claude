@@ -6,14 +6,18 @@
  * SDK (`-p --output-format stream-json`) never mounts it. A CLI used only from
  * OpenCode therefore stays on the version it was installed with, and models
  * released since never show up. The plugin runs `claude update` for it: in
- * the background, once per interval per server process, with the outcome
- * recorded next to models.json. Concurrent servers (two OpenCode processes
- * on one machine) are serialized by Claude Code itself: the install runs
- * under its per-version lock, and the loser just reports busy.
+ * the background, once per interval across every server process on the
+ * machine, with the outcome recorded next to models.json. The record is
+ * claimed before `claude update` starts: Claude Code's own version lock only
+ * makes a concurrent run wait and then report the same update, so without
+ * the claim each OpenCode server downloads the release once more.
  *
  * `claude update` needs no terminal. It prints plain lines and exits 0 even
  * when it did nothing (another process held the version lock, or a package
- * manager owns the install), so the outcome is read from its output.
+ * manager owns the install), so the outcome is read from its output. It also
+ * reports success when the new launcher could not be put in place (Windows,
+ * the launcher held open by another program), so every run ends with
+ * `claude --version`, and an outcome naming a version must match it.
  */
 import { spawn } from "node:child_process";
 import {
@@ -31,22 +35,28 @@ import {
   cliInvocation,
   resetClaudeCliResolutionCache,
   resolveClaudeCli,
+  runCliProbe,
 } from "./executable-path.js";
 import { log } from "./log.js";
 
-export type ClaudeCliUpdateOutcome =
+export type ClaudeCliUpdateOutcome = (
   | { kind: "updated"; from: string; to: string }
   | { kind: "up-to-date"; version: string | null }
   /** Another Claude process held the update lock; the CLI asks to retry later. */
   | { kind: "busy" }
   /** winget, Homebrew, apt and friends: the CLI leaves updates to them. */
   | { kind: "package-manager" }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; message: string }
+) & {
+  /** What `claude --version` reported after the run; null when it gave nothing. */
+  installed?: string | null;
+};
 
 export type ClaudeCliUpdateRecord = {
   /** ISO time of the last attempt. */
   at: string;
-  outcome: ClaudeCliUpdateOutcome;
+  /** `running` while `claude update` is under way in process `pid`. */
+  outcome: ClaudeCliUpdateOutcome | { kind: "running"; pid: number };
 };
 
 type Env = NodeJS.ProcessEnv | Record<string, string | undefined>;
@@ -55,6 +65,11 @@ type Env = NodeJS.ProcessEnv | Record<string, string | undefined>;
 const DEFAULT_INTERVAL_MS = 60 * 60_000;
 /** Download of the ~240 MB binary, checksum and launcher swap. */
 const UPDATE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * `claude --version` after the run. Longer than the 4 s detection probes: the
+ * first start of a freshly installed binary waits for the antivirus scan.
+ */
+const VERSION_CHECK_TIMEOUT_MS = 60_000;
 
 export function cliUpdateIntervalMs(env: Env = process.env): number {
   const raw = Number(env.OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS);
@@ -120,7 +135,9 @@ function appendCliUpdateLog(record: ClaudeCliUpdateRecord, env: Env): void {
   if (outcome.kind === "updated") {
     line = `updated ${outcome.from} -> ${outcome.to}`;
   } else if (outcome.kind === "failed") {
-    line = `failed: ${outcome.message}`;
+    // The version the CLI stayed on, when `claude --version` answered.
+    const installed = outcome.installed ? ` (CLI ${outcome.installed})` : "";
+    line = `failed${installed}: ${outcome.message}`;
   } else {
     return;
   }
@@ -171,14 +188,33 @@ function writeCliUpdateRecord(record: ClaudeCliUpdateRecord, env: Env): boolean 
 /**
  * `claude update` prints its progress first ("Current version: …",
  * "Checking for updates…") and the verdict last, so an error is on the last
- * non-empty line.
+ * non-empty line. A failed install ends with three lines instead:
+ *
+ *   Error: Failed to install native update
+ *   TelemetrySafeError: The connection dropped while downloading the update …
+ *   Try running "claude doctor" for diagnostics
+ *
+ * The last one is only a hint; the cause is the lines between "Error:" and
+ * it, so those are kept, joined into one line.
  */
-function lastMeaningfulLine(text: string): string {
-  const lines = text.split(/\r?\n/).map((line) => line.trim());
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.length > 0) return lines[i]!;
+function failureMessage(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return "";
+  const last = lines.length - 1;
+  if (!/Try running "claude doctor"/.test(lines[last]!)) return lines[last]!;
+  let errorLine = -1;
+  for (let i = last - 1; i >= 0; i--) {
+    if (lines[i]!.startsWith("Error:")) {
+      errorLine = i;
+      break;
+    }
   }
-  return "";
+  // No "Error:" line: the line before the hint is the best guess.
+  if (errorLine < 0) return lines[Math.max(0, last - 1)]!;
+  return lines.slice(errorLine, last).join(": ");
 }
 
 /** The lines `claude update` prints (Claude Code 2.1.280), by outcome. */
@@ -214,6 +250,8 @@ export async function updateClaudeCli(options?: {
   timeoutMs?: number;
   /** Test seam; the plugin drops the memoized CLI path after an update. */
   resetResolution?: () => void;
+  /** Test seam for the `claude --version` check after the run. */
+  probeVersion?: (binaryPath: string, env: Env) => Promise<string | null>;
 }): Promise<ClaudeCliUpdateOutcome> {
   if (updating) return { kind: "busy" };
   updating = true;
@@ -242,29 +280,81 @@ export async function updateClaudeCli(options?: {
         label: "claude update",
       },
     );
-    const outcome = parseClaudeUpdateOutput(result.output ?? "");
-    if (outcome?.kind === "updated") {
+    const outcome = outcomeOfRun(result);
+    let checkedPath = binaryPath;
+    if (outcome.kind === "updated") {
       // The install may change layout (npm's cli.js gives way to
       // bin/claude.exe); the next turn must look for the binary again
-      // instead of reusing the memoized path.
+      // instead of reusing the memoized path, and so does the check below.
       (options?.resetResolution ?? resetClaudeCliResolutionCache)();
+      if (options?.binaryPath === undefined) {
+        checkedPath = (await resolveClaudeCli(env)) ?? binaryPath;
+      }
     }
-    if (outcome) return outcome;
-    if (!result.ok && result.output === undefined) {
-      // Never ran to the end: a spawn error or the timeout, named in message.
-      return { kind: "failed", message: result.message };
-    }
-    const verdict = lastMeaningfulLine(result.output ?? "");
-    if (verdict) return { kind: "failed", message: verdict };
-    return {
-      kind: "failed",
-      message: result.ok
-        ? "claude update printed nothing to judge the outcome by."
-        : result.message,
-    };
+    const installed = await (options?.probeVersion ?? probeCliVersion)(
+      checkedPath,
+      env,
+    );
+    return withInstalledVersion(outcome, installed);
   } finally {
     updating = false;
   }
+}
+
+function outcomeOfRun(result: Awaited<ReturnType<typeof runInstaller>>): ClaudeCliUpdateOutcome {
+  const outcome = parseClaudeUpdateOutput(result.output ?? "");
+  if (outcome) return outcome;
+  if (!result.ok && result.output === undefined) {
+    // Never ran to the end: a spawn error or the timeout, named in message.
+    return { kind: "failed", message: result.message };
+  }
+  const verdict = failureMessage(result.output ?? "");
+  if (verdict) return { kind: "failed", message: verdict };
+  return {
+    kind: "failed",
+    message: result.ok
+      ? "claude update printed nothing to judge the outcome by."
+      : result.message,
+  };
+}
+
+/** The version `claude --version` prints, or null when it printed none. */
+async function probeCliVersion(binaryPath: string, env: Env): Promise<string | null> {
+  const run = await runCliProbe(binaryPath, ["--version"], {
+    env,
+    timeoutMs: VERSION_CHECK_TIMEOUT_MS,
+  });
+  if (run.failed) return null;
+  return /(\d+\.\d+\.\d+)/.exec(run.stdout)?.[1] ?? null;
+}
+
+/**
+ * An outcome that names the version the CLI should now be on must agree
+ * with `claude --version`. On Windows `claude update` reports success when
+ * it kept the old launcher (another program held it open during the swap);
+ * the version check is what tells.
+ */
+function withInstalledVersion(
+  outcome: ClaudeCliUpdateOutcome,
+  installed: string | null,
+): ClaudeCliUpdateOutcome {
+  let expected: string | null = null;
+  let claim = "";
+  if (outcome.kind === "updated") {
+    expected = outcome.to;
+    claim = `claude update reported ${outcome.from} -> ${outcome.to}`;
+  } else if (outcome.kind === "up-to-date" && outcome.version) {
+    expected = outcome.version;
+    claim = `claude update reported ${outcome.version} as up to date`;
+  }
+  if (expected !== null && installed !== expected) {
+    return {
+      kind: "failed",
+      message: `${claim}, but \`claude --version\` reports ${installed ?? "no version"}`,
+      installed,
+    };
+  }
+  return { ...outcome, installed };
 }
 
 function logOutcome(outcome: ClaudeCliUpdateOutcome): void {
@@ -292,14 +382,33 @@ function logOutcome(outcome: ClaudeCliUpdateOutcome): void {
 }
 
 /**
+ * Whether the record still holds off the next attempt. A finished attempt
+ * holds for the interval. A `running` claim holds at least as long as a run
+ * may take, so a short interval cannot start a second run beside a slow one;
+ * the claim of a process that died mid-run expires the same way.
+ */
+function recordHoldsOff(record: ClaudeCliUpdateRecord, now: number, intervalMs: number): boolean {
+  let holdMs = intervalMs;
+  if (record.outcome.kind === "running") {
+    holdMs = Math.max(intervalMs, UPDATE_TIMEOUT_MS + VERSION_CHECK_TIMEOUT_MS);
+  }
+  // An unreadable `at` (a hand-edited file) compares as NaN and falls
+  // through to one extra run, the safe side; not guarded further.
+  return now - Date.parse(record.at) < holdMs;
+}
+
+/**
  * Start the periodic check for this plugin instance; returns the stop
  * function for the plugin's cleanup. OpenCode runs one plugin instance per
- * location, so every instance keeps its own timer, but the record file is
- * shared: whichever instance finds the interval elapsed runs the update, the
- * others read the fresh record and skip. The first check runs right away, so
- * a server that was idle for days catches up as soon as a plugin loads.
- * Models of a new version reach OpenCode the next time it loads the plugin,
- * which is when the catalog is read.
+ * location, and a machine may run several OpenCode servers, so every
+ * instance keeps its own timer, but the record file is shared: the instance
+ * that finds the interval elapsed claims the record (`running`) before it
+ * starts `claude update`, and the others read the claim and skip. Two
+ * instances can still both start only if they read the record within the
+ * same few milliseconds. The first check runs right away, so a server that
+ * was idle for days catches up as soon as a plugin loads. Models of a new
+ * version reach OpenCode the next time it loads the plugin, which is when
+ * the catalog is read.
  */
 export function startClaudeCliAutoUpdate(params: {
   options?: { cliAutoUpdate?: unknown };
@@ -332,13 +441,21 @@ export function startClaudeCliAutoUpdate(params: {
     if (stopped || updating) return;
     const record = readCliUpdateRecord(env);
     const now = Date.now();
-    // An unreadable `at` (a hand-edited file) compares as NaN and falls
-    // through to one extra run, the safe side; not guarded further.
-    if (record && now - Date.parse(record.at) < intervalMs) return;
-    if (!record && now - unrecordedAttemptAt < intervalMs) return;
+    if (record && recordHoldsOff(record, now, intervalMs)) return;
+    // Also over an old record that could not be replaced by the last claim.
+    if (now - unrecordedAttemptAt < intervalMs) return;
+    const at = new Date(now).toISOString();
+    const claimed = writeCliUpdateRecord(
+      { at, outcome: { kind: "running", pid: process.pid } },
+      env,
+    );
+    // The record cannot be written (read-only data dir, full disk): the
+    // attempt still counts within this process, and the outcome is not
+    // written either, to warn about the record once.
+    if (!claimed) unrecordedAttemptAt = now;
     const outcome = await update();
-    const attempt = { at: new Date(now).toISOString(), outcome };
-    if (!writeCliUpdateRecord(attempt, env)) unrecordedAttemptAt = now;
+    const attempt = { at, outcome };
+    if (claimed) writeCliUpdateRecord(attempt, env);
     appendCliUpdateLog(attempt, env);
     logOutcome(outcome);
   };

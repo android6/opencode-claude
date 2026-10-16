@@ -6,7 +6,8 @@
   runs only from its interactive screen, so a CLI driven through the Agent
   SDK stayed on its install-day version and new models (Sonnet 5.5, Haiku 5.5)
   never showed up. The plugin now runs `claude update` in the background about
-  once an hour and records the outcome in
+  once an hour (once across all OpenCode servers on the machine), checks the
+  result with `claude --version`, and records the outcome in
   `~/.local/share/opencode-claude/cli-update.json`. Off with
   `cliAutoUpdate: false` in the plugin options or Claude Code's
   `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or
