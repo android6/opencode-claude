@@ -207,12 +207,9 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
         err instanceof Error ? err.message : err,
       );
     }
-    const cliPresent = await probeCliPresence();
-    // Refresh the catalog from the CLI in the background; the cached or
-    // fallback list serves until it lands.
-    if (cliPresent) {
-      void refreshModelCatalog(() => ctx.provider.reload());
-    }
+    // The provider and its hook go in before anything slow: until then the
+    // models are missing from OpenCode's catalog, and a session stepping
+    // during a plugin reload fails with "Model unavailable".
     await ctx.provider.transform((providers) => {
       providers.add({
         info: buildProviderInfo(currentProxyBaseUrl()),
@@ -245,6 +242,13 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       },
       { providerID: PROVIDER_ID },
     );
+
+    const cliPresent = await probeCliPresence();
+    // Refresh the catalog from the CLI in the background; the cached or
+    // fallback list serves until it lands.
+    if (cliPresent) {
+      void refreshModelCatalog(() => ctx.provider.reload());
+    }
 
     await ctx.integration.transform((integrations) => {
       for (const registration of buildAuthMethods(cliPresent, directory)) {
@@ -401,16 +405,36 @@ export function buildAuthMethods(
  * missing.
  */
 async function probeCliPresence(): Promise<boolean> {
-  try {
-    const detection = await Promise.race([
-      detectClaudeCode(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-    ]);
-    return detection ? detection.status !== "missing-cli" : true;
-  } catch {
-    return true;
-  }
+  if (cliPresentAt && Date.now() - cliPresentAt < CLI_PRESENT_TTL_MS) return true;
+  if (cliProbe) return cliProbe;
+  const probe = (async () => {
+    try {
+      const detection = await Promise.race([
+        detectClaudeCode(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+      const present = detection ? detection.status !== "missing-cli" : true;
+      // A missing CLI is not remembered, so a fresh install shows at once.
+      if (detection && present) cliPresentAt = Date.now();
+      return present;
+    } catch {
+      return true;
+    }
+  })();
+  cliProbe = probe;
+  void probe.finally(() => {
+    if (cliProbe === probe) cliProbe = undefined;
+  });
+  return cliProbe;
 }
+
+/**
+ * Every location sets the plugin up, all at once after a reload: they share
+ * one probe in flight, and a CLI found present stays so for a while.
+ */
+const CLI_PRESENT_TTL_MS = 5 * 60_000;
+let cliProbe: Promise<boolean> | undefined;
+let cliPresentAt = 0;
 
 function alreadySignedInResponse(methodID: string) {
   return {

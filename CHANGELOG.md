@@ -18,6 +18,27 @@
   and answers with a server error; OpenCode retries it a few seconds later
   and the retry finds the CLI anew.
 
+## 1.4.1 - 2026-10-13
+
+- **Opus 5.5's update before a tool call shows as text**: the short "found
+  X, now checking Y" note often landed in the Thinking panel. It now shows
+  as a message. Thanks to @JosueGalRe.
+- **Fix: compaction told Claude you had rejected its tool calls**: when
+  OpenCode compacted a chat mid-turn, the summary said the user rejected the
+  pending calls and interrupted, so Claude stopped and asked for permission
+  again. The summary now knows the plugin stopped the turn, and gets the
+  results OpenCode already has. Thanks to @sporez.
+- **Fix: parallel generate calls cancelled each other**: plugins running
+  several `generate.text` calls at once with the same instructions got
+  "ended the turn without any output" on all but one. Thanks to @sporez.
+- **Fewer "Model unavailable" errors on OpenCode v2 reloads**: the Claude
+  models are back in the catalog right away instead of after the CLI
+  check, and locations share one check. Thanks to @mradwankhalil.
+- **Works as root**: chats with tools no longer fail on a root-only VPS.
+  Thanks to @a-johanes.
+- **Haiku 5.5 has its full 1M window**: it was listed at 200K and compacted
+  early. Thanks to @aaa1124.
+
 ## 1.4.0 - 2026-10-11
 
 - **Windows support**: on Windows with an npm-installed Claude Code, the

@@ -357,7 +357,9 @@ async function main() {
     await sleep(20);
     assert.equal(slowRuns, 1, "a running claim keeps other instances off");
     release();
-    await sleep(20);
+    // Under load the outcome can take longer than a fixed pause: wait for it.
+    const deadline = Date.now() + 1000;
+    while (readCliUpdateRecord(env)?.outcome.kind === "running" && Date.now() < deadline) await sleep(10);
     assert.equal(readCliUpdateRecord(env)?.outcome.kind, "up-to-date", "the outcome replaces the claim");
     stopS1();
     stopS2();
