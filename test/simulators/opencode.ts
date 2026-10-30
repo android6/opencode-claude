@@ -1904,8 +1904,14 @@ const upFrom = (start: string, stop?: string) => {
     if ((stop && resolve(stop).toLowerCase() === resolve(current).toLowerCase()) || dirname(current) === current) return out;
   }
 };
+/**
+ * The home folder as the world set it (HOME, Windows' USERPROFILE), else the system's. OpenCode reads `os.homedir()`;
+ * Bun's on Linux answers from the account, not from HOME, so a world under the real home (a CI runner's) would make
+ * OpenCode's home rule below read the files above the test's repository: the world's empty home is the one meant.
+ */
+const homeDir = () => process.env.HOME || process.env.USERPROFILE || homedir();
 /** OpenCode's own configuration folder (util/global-roots.ts): OPENCODE_CONFIG_DIR, else XDG_CONFIG_HOME or ~/.config, `opencode`. */
-export const openCodeConfigDir = () => process.env.OPENCODE_CONFIG_DIR ?? join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
+export const openCodeConfigDir = () => process.env.OPENCODE_CONFIG_DIR ?? join(process.env.XDG_CONFIG_HOME || join(homeDir(), ".config"), "opencode");
 /** The project's folder (project/project.ts resolve): the work tree of the nearest `.git`, else the directory itself. */
 const projectRoot = (directory: string) => upFrom(directory).find((dir) => existsSync(join(dir, ".git")) || existsSync(join(dir, ".hg"))) ?? directory;
 /**
@@ -1918,7 +1924,7 @@ const projectRoot = (directory: string) => upFrom(directory).find((dir) => exist
 export function instructionFiles(directory: string, configured: string[] = []): Array<{ path: string; content: string }> {
   const start = resolvedPath(directory);
   const root = resolvedPath(projectRoot(directory));
-  const home = resolvedPath(homedir());
+  const home = resolvedPath(homeDir());
   const contains = (parent: string, child: string) => {
     const rel = relative(parent, child);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
@@ -1943,7 +1949,7 @@ export function instructionFiles(directory: string, configured: string[] = []): 
     }
   };
   const matches = (source: string) => {
-    const expanded = source.startsWith("~/") ? join(homedir(), source.slice(2)) : source;
+    const expanded = source.startsWith("~/") ? join(homeDir(), source.slice(2)) : source;
     if (isAbsolute(expanded)) return scan(basename(expanded), dirname(expanded));
     if (project) return upFrom(start, root).flatMap((dir) => scan(expanded, dir));
     return scan(expanded, openCodeConfigDir());

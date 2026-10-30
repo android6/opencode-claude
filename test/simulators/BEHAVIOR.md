@@ -171,7 +171,10 @@ parameters of a query), `overload-regression.ts` (a failed model call and OpenCo
   the home folder instead when the directory is inside it), nearest first, then the configuration's `instructions` —
   an absolute path or pattern in its own folder, a relative one in every folder from the directory up to the
   project's, the matches sorted; a file once, where it first came; "Instructions from: <resolved path>\n<content as
-  read>" (`instruction-discovery.ts` `render`). No CLAUDE.md or CONTEXT.md fallback in 2.0.32.
+  read>" (`instruction-discovery.ts` `render`). No CLAUDE.md or CONTEXT.md fallback in 2.0.32. The home folder of the
+  rule is the world's (HOME, Windows' USERPROFILE), not the account's: Bun's `os.homedir()` on Linux ignores HOME, and
+  a world under the real home (a CI runner's `/home/runner`) would otherwise read the files above the test's
+  repository (seen 30.10.2026 on GitHub Actions).
 - OpenCode's own tools, there with no MCP server, no skill and no plugin of the user's: the `skill` tool
   (`tool/plugin/skill.ts`; no skill listed, so no skills section) and `execute` with the `opencode` namespace —
   `session_rename`, `session_move`, `worktree_create`, `worktree_list`, `worktree_remove`, `models`
@@ -583,7 +586,10 @@ parameters of a query), `overload-regression.ts` (a failed model call and OpenCo
 - Install layouts (`installCli(dir, { layout })`, each returns its own handle with `set` / `calls`; the first is the
   world's, `claude.cli`): `npm-legacy` (npm's `claude.cmd` and the package's `cli.js`, run through node; the
   default), `npm` (npm's `claude.cmd` and the package's `bin/claude.exe` — the `bin` of 2.1.312 by `npm view`),
-  `local-bin` (the official installer's `claude.exe` alone), `orphan` (npm's shims with no package). The binaries
+  `local-bin` (the official installer's `claude.exe` alone), `orphan` (npm's shims with no package). Off Windows the
+  layouts write the sh shim `claude` too, and the `.cmd` shim on every platform (a test may pin `process.platform` to
+  win32 on a Linux runner); the sh shim names node by its full path, since the plugin proves a candidate off Windows
+  by running `--version` with the PATH a test gives it, which may hold the install's folder alone. The binaries
   are the same program compiled by `bun build --compile`, once per version of `claude-cli.mjs`, in
   `%TEMP%\opencode-claude-simulator-cli\<digest>` (about 110 MB), hard-linked into each layout; built under a name of
   its own process and then renamed, as is the world's link of node, so tests may run side by side. The answers
