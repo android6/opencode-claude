@@ -4,7 +4,8 @@
  * Node/Bun refuse to spawn a batch file with the SDK's `--settings` JSON.
  * npm's shim is unwrapped to the native `claude.exe` / `cli.js` beside it.
  *
- * Runs on any OS: `process.platform` is pinned to win32 for this process.
+ * The resolver's checks run on any OS: `process.platform` is pinned to win32 for this process. The turn through the
+ * real SDK runs on Windows itself only (the OS splits PATH and finds `node` its own way).
  *
  * On the simulators (test/simulators/): the CLI is the Claude Code
  * simulator's process, laid out by `installCli(dir, { layout })` as each
@@ -32,6 +33,9 @@ import type { CliLayout } from "./simulators/claude-code.ts";
 import { createWorld, pluginModule } from "./simulators/world.ts";
 
 async function main() {
+  // The resolver's checks run under a pinned win32 on any OS; the turn through the real SDK only on Windows itself:
+  // the pin cannot change how the OS splits PATH (":" off Windows) or finds `node` for the SDK's child.
+  const realPlatform = process.platform;
   Object.defineProperty(process, "platform", { value: "win32" });
   const world = await createWorld("windows-cli");
   const { claude } = world;
@@ -107,18 +111,22 @@ async function main() {
     // What the plugin's query start hands the SDK: cli.js with `executable: "node"`, an exe as it is.
     // A chat turn through the plugin's real query starter and the real SDK (world.throughRealSdk): the CLI
     // logs what ran it.
-    await world.opencode.startPlugin();
-    const runnersOfTurn = async (cli: { calls: typeof claude.cli.calls }) => [(await world.throughRealSdk(cli)).runner];
-    assert.deepEqual(await runnersOfTurn(claude.cli), ["node"], "the world's cli.js runs through node");
-    // A host whose PATH has npm's native binary first.
-    const worldPath = process.env.PATH!;
-    process.env.PATH = [npm, ...worldPath.split(delimiter).slice(1)].join(delimiter);
-    try {
-      resetClaudeCliResolutionCache();
-      assert.deepEqual(await runnersOfTurn(npmCli), ["claude"], "the exe runs as it is");
-    } finally {
-      process.env.PATH = worldPath;
-      resetClaudeCliResolutionCache();
+    if (realPlatform === "win32") {
+      await world.opencode.startPlugin();
+      const runnersOfTurn = async (cli: { calls: typeof claude.cli.calls }) => [(await world.throughRealSdk(cli)).runner];
+      assert.deepEqual(await runnersOfTurn(claude.cli), ["node"], "the world's cli.js runs through node");
+      // A host whose PATH has npm's native binary first.
+      const worldPath = process.env.PATH!;
+      process.env.PATH = [npm, ...worldPath.split(delimiter).slice(1)].join(delimiter);
+      try {
+        resetClaudeCliResolutionCache();
+        assert.deepEqual(await runnersOfTurn(npmCli), ["claude"], "the exe runs as it is");
+      } finally {
+        process.env.PATH = worldPath;
+        resetClaudeCliResolutionCache();
+      }
+    } else {
+      console.log(`the turn through the real SDK: only on Windows itself (this is ${realPlatform})`);
     }
     assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
