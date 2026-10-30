@@ -48,8 +48,11 @@ async function main() {
     await setups;
     const answered = await turn;
     assert.ok(answered.ok, `the turn during the setups answered: ${answered.requests.at(-1)?.status}`);
-    // The setups' shared probe and the turn's own plan check: two sign-in checks, one version check.
-    assert.equal(claude.cli.calls().filter((call) => call.args[0] === "--version").length, 1, "one shared version check");
+    // The setups' shared probe and the turn's own plan check: two sign-in checks, one version check. Off Windows the
+    // plugin first proves the CLI it found on PATH by running `--version` once (executable-path.ts probeClaude; on
+    // Windows the shim is unwrapped on disk), so one more version check there.
+    const versionChecks = process.platform === "win32" ? 1 : 2;
+    assert.equal(claude.cli.calls().filter((call) => call.args[0] === "--version").length, versionChecks, "one shared version check");
     assert.equal(claude.cli.calls().filter((call) => call.args[0] === "auth").length, 2, "one shared probe (and the turn's plan check)");
     assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {

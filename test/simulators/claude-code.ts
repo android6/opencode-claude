@@ -786,10 +786,19 @@ function placeExe(at: string) {
 function layOutCli(binDir: string, layout: CliLayout = "npm-legacy"): string | undefined {
   const pkg = join(binDir, "node_modules", "@anthropic-ai", "claude-code");
   const windows = process.platform === "win32";
+  // The sh shim names node by its path: the plugin proves a candidate off Windows by running it (`--version`) with
+  // the PATH a test gives it, which may hold the install's folder alone. The .cmd shim is written on every platform:
+  // a test may pin `process.platform` to win32 and look for it on a Linux runner.
+  const node = Bun.which("node") ?? "node";
+  // Executable bits as npm sets them on its bin files: the plugin checks a candidate on disk with X_OK, which on
+  // Linux a plain written file fails (on Windows every file passes).
+  const executable = (path: string, text: string) => {
+    writeFileSync(path, text);
+    chmodSync(path, 0o755);
+  };
   const npmShim = () => {
-    writeFileSync(join(binDir, "claude.cmd"), `@echo off\r\nnode "%~dp0node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n`);
-    writeFileSync(join(binDir, "claude"), `#!/bin/sh\nexec node "${join(pkg, "cli.js")}" "$@"\n`);
-    chmodSync(join(binDir, "claude"), 0o755);
+    executable(join(binDir, "claude.cmd"), `@echo off\r\nnode "%~dp0node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n`);
+    executable(join(binDir, "claude"), `#!/bin/sh\nexec "${node}" "${join(pkg, "cli.js")}" "$@"\n`);
   };
   mkdirSync(binDir, { recursive: true });
   if (layout === "orphan") {
@@ -802,20 +811,14 @@ function layOutCli(binDir: string, layout: CliLayout = "npm-legacy"): string | u
   }
   if (layout === "npm") {
     placeExe(join(pkg, "bin", windows ? "claude.exe" : "claude"));
-    if (windows) writeFileSync(join(binDir, "claude.cmd"), `@echo off\r\n"%~dp0node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n`);
-    else {
-      writeFileSync(join(binDir, "claude"), `#!/bin/sh\nexec "${join(pkg, "bin", "claude")}" "$@"\n`);
-      chmodSync(join(binDir, "claude"), 0o755);
-    }
+    executable(join(binDir, "claude.cmd"), `@echo off\r\n"%~dp0node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n`);
+    if (!windows) executable(join(binDir, "claude"), `#!/bin/sh\nexec "${join(pkg, "bin", "claude")}" "$@"\n`);
     return join(pkg, "bin");
   }
   mkdirSync(pkg, { recursive: true });
-  writeFileSync(join(pkg, "cli.js"), `import(${JSON.stringify(pathToFileURL(join(simulatorDir, "claude-cli.mjs")).href)});\n`);
-  if (windows) writeFileSync(join(binDir, "claude.cmd"), `@echo off\r\nnode "%~dp0node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n`);
-  else {
-    writeFileSync(join(binDir, "claude"), `#!/bin/sh\nexec node "${join(pkg, "cli.js")}" "$@"\n`);
-    chmodSync(join(binDir, "claude"), 0o755);
-  }
+  executable(join(pkg, "cli.js"), `import(${JSON.stringify(pathToFileURL(join(simulatorDir, "claude-cli.mjs")).href)});\n`);
+  executable(join(binDir, "claude.cmd"), `@echo off\r\nnode "%~dp0node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n`);
+  if (!windows) executable(join(binDir, "claude"), `#!/bin/sh\nexec "${node}" "${join(pkg, "cli.js")}" "$@"\n`);
   return pkg;
 }
 
