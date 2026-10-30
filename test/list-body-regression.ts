@@ -121,7 +121,9 @@ async function main() {
         "[This image was removed to reduce the request size and is no longer visible. Do not make claims about its contents from memory. If needed, retrieve it again with an available tool or ask the user to attach it again.]";
       const image = (label: string, path?: string) => ({ mediaType: "image/png", data: testPng(label), ...(path ? { path } : {}) });
       const chat = opencode.newChat();
-      await opencode.say(chat, "what is on it?", [image("shot-1", "C:\\work\\shot-1.png"), image("shot-2", "C:\\work\\shot-2.png")]);
+      // Absolute paths of the platform: a Windows path is relative on Linux and would be resolved against the cwd.
+const work = process.platform === "win32" ? "C:\\work\\" : "/work/";
+await opencode.say(chat, "what is on it?", [image("shot-1", `${work}shot-1.png`), image("shot-2", `${work}shot-2.png`)]);
       await run(chat);
       await opencode.say(chat, "", [image("alone")]);
       await run(chat);
@@ -134,7 +136,7 @@ async function main() {
         const id = await opencode.say(chat, latest);
         const { turn, query } = await run(chat);
         const body = turn.requests[0]!.body.messages.filter((m) => m.role === "user");
-        assert.equal(body[0]!.content, `what is on it?Attached file: C:\\work\\shot-1.png${removed}Attached file: C:\\work\\shot-2.png${removed}`, `turn ${n}: the first images are OpenCode's notes`);
+        assert.equal(body[0]!.content, `what is on it?Attached file: ${work}shot-1.png${removed}Attached file: ${work}shot-2.png${removed}`, `turn ${n}: the first images are OpenCode's notes`);
         assert.equal(body[1]!.content, removed, `turn ${n}: the image alone is its note`);
         assert.ok(turn.requests[0]!.list[0]!.content.some((p) => p.type === "media"), `turn ${n}: the list still holds the image`);
         assert.equal(query.trigger, userRecordName(id, 1), `turn ${n} is named after its question`);
