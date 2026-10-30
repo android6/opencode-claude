@@ -63,6 +63,21 @@ export async function loadClaudeAgentSdk(): Promise<SdkModule> {
   return sdkModulePromise;
 }
 
+/**
+ * Copy a Claude session's chain up to `upToMessageId` into a new session
+ * (fresh uuids, no side branches) and return the new id. A plain resume of
+ * the copy sees exactly that history, wherever other branches went.
+ */
+export async function forkClaudeSession(
+  sessionId: string,
+  upToMessageId: string,
+): Promise<string> {
+  const sdk = await loadClaudeAgentSdk();
+  const result = await sdk.forkSession(sessionId, { upToMessageId });
+  if (!result?.sessionId) throw new Error("forkSession returned no session id");
+  return result.sessionId;
+}
+
 export function resetClaudeAgentSdkCache(): void {
   sdkModule = null;
   sdkModulePromise = null;
@@ -120,19 +135,6 @@ export function killProcessTree(
   }
 }
 
-/**
- * The `result` event that ends a turn. A record appended without a turn
- * (`shouldQuery: false`) gets a `result` of its own with `num_turns: 0`; it
- * is not the end of the stream, and carries no usage of a model call.
- */
-export function isTurnResult(event: unknown): boolean {
-  if (!event || typeof event !== "object") return false;
-  const e = event as { type?: unknown; is_error?: unknown; num_turns?: unknown };
-  if (e.type !== "result") return false;
-  if (e.is_error === true) return true;
-  return e.num_turns !== 0;
-}
-
 export type ClaudeQueryHandle = {
   stream: AsyncIterable<unknown>;
   interrupt: () => Promise<void>;
@@ -181,7 +183,9 @@ export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQuer
   let ended = false;
   let sawResult = false;
   const observe = (event: unknown) => {
-    if (isTurnResult(event)) sawResult = true;
+    if (event && typeof event === "object" && (event as { type?: unknown }).type === "result") {
+      sawResult = true;
+    }
     for (const listener of listeners) {
       try {
         listener(event);
@@ -271,8 +275,6 @@ export type StartClaudeQueryParams = {
   cwd: string;
   model?: string;
   resume?: string;
-  /** The id (file name) of a new session, chosen by the plugin: without `resume`, or with `forkSession`. */
-  sessionId?: string;
   /** With `resume`: resume only up to and including this entry. */
   resumeSessionAt?: string;
   /** With `resume`: continue in a new session id instead of appending. */
@@ -311,6 +313,8 @@ export type StartClaudeQueryParams = {
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
+  /** Auto-compact long conversations (Claude Code default). */
+  autoCompactEnabled?: boolean;
   /** Stop utility queries such as title generation after one model turn. */
   maxTurns?: number;
   /** false keeps one-shot utility turns out of ~/.claude/projects history. */
@@ -379,10 +383,6 @@ export async function startClaudeQuery(
     if (resumeAt) options.resumeSessionAt = resumeAt;
     if (params.forkSession === true) options.forkSession = true;
   }
-  // The name of a new transcript: a new chat's, or a fork's copy of the
-  // resumed one (`forkSession`: the copy keeps the uuids, probe 12).
-  const sessionId = trimmedString(params.sessionId);
-  if (sessionId && (!resume || params.forkSession === true)) options.sessionId = sessionId;
 
   const permissionMode = trimmedString(params.permissionMode);
   if (ALLOWED_PERMISSION_MODES.has(permissionMode)) {
@@ -405,18 +405,13 @@ export async function startClaudeQuery(
     options.thinking = { type: "adaptive" };
   }
 
+  if (params.autoCompactEnabled !== false) {
+    options.autoCompactEnabled = true;
+  }
+
   if (params.persistSession === false) options.persistSession = false;
 
   const settings: Record<string, unknown> = {};
-  // OpenCode compacts the chat, so Claude Code's own auto-compaction stays
-  // off. Two compactors with their own thresholds would work on one session:
-  // a compaction boundary the CLI writes into the transcript makes every
-  // resume before it impossible, and OpenCode never sees that summary. An
-  // overflow still ends well: the CLI's "Prompt is too long" comes back to
-  // OpenCode as a context overflow (failure.ts), which compacts and retries.
-  // The switch is the `autoCompactEnabled` setting; a top-level option of
-  // that name is unknown to the SDK and changed nothing.
-  settings.autoCompactEnabled = false;
   if (params.isolateMcp === true) {
     options.strictMcpConfig = true;
     settings.disableClaudeAiConnectors = true;
@@ -573,4 +568,52 @@ export async function startClaudeQuery(
     close,
     getPid,
   });
+}
+
+/**
+ * Ask the local CLI which models this account can use. Starts a Claude Code
+ * process with no prompt: no model call is made and nothing is persisted.
+ */
+export async function listClaudeSupportedModels(
+  timeoutMs = 20_000,
+): Promise<unknown[] | null> {
+  const sdk = await loadClaudeAgentSdk();
+  const queryFn = (sdk as { query?: Function }).query;
+  if (typeof queryFn !== "function") return null;
+  let release: () => void = () => {};
+  const idle = (async function* () {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  })();
+  const env = buildClaudeCodeChildEnv(process.env);
+  const pathToClaudeCodeExecutable = await resolveClaudeCodeExecutable({ env });
+  const q = queryFn({
+    prompt: idle,
+    options: {
+      env,
+      persistSession: false,
+      settingSources: [],
+      strictMcpConfig: true,
+      settings: { disableClaudeAiConnectors: true },
+      ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+      ...(pathToClaudeCodeExecutable && isJsEntrypoint(pathToClaudeCodeExecutable)
+        ? { executable: "node" as const }
+        : {}),
+    },
+  }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (typeof q.supportedModels !== "function") return null;
+    return await Promise.race([
+      q.supportedModels(),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+    q.close?.();
+  }
 }

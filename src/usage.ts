@@ -1,9 +1,8 @@
 /**
- * Convert Claude Agent SDK usage into OpenAI-compatible usage objects.
+ * Convert Claude Agent SDK result usage into OpenAI-compatible usage objects.
  *
- * A response reports one Anthropic API call's usage (TurnUsageTracker). The
- * `result` event's totals (`modelUsage`, else `usage`) are sums of many calls
- * and only lend a response their cost and per-model breakdown.
+ * Prefer `modelUsage` for totals (includes compact / auxiliary pipeline calls).
+ * Fall back to per-turn `usage` (main agent loop only).
  */
 
 export type OpenAIUsage = {
@@ -242,50 +241,106 @@ function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
   };
 }
 
+/** Field-wise `a - b`, clamped at zero; null when nothing grew. */
+function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null {
+  if (!b) return { ...a };
+  const diff = (x?: number, y?: number) => Math.max(0, (x ?? 0) - (y ?? 0));
+  const prompt = diff(a.prompt_tokens, b.prompt_tokens);
+  const completion = diff(a.completion_tokens, b.completion_tokens);
+  const cached = diff(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = diff(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = diff(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  if (prompt + completion + cached + cacheWrite + reasoning === 0) return null;
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
 /**
- * The usage a response reports: one Anthropic API call's, the last one the
- * response started after Claude Code last compacted the conversation. Every
- * call sends the whole conversation, so its prompt is the context as it
- * stands and its prompt plus output the context after it. OpenCode reads the
- * usage exactly so and compacts when it reaches the model's input limit.
- * Adding calls up would count the earlier calls' answers twice: they are
- * already inside the last call's prompt.
+ * Per-HTTP-response usage, one entry per Anthropic API call. The SDK reports
+ * a call's usage several times: the assistant events carry the message_start
+ * snapshot (output_tokens ≈ 1-4) and only message_delta has the final
+ * output. Keeping the max per message id makes the final numbers win.
  *
- * The SDK reports a call's usage several times: the assistant events carry
- * the message_start snapshot (output_tokens ≈ 1-4) and only message_delta
- * has the final output. Keeping the max per message id makes the final
- * numbers win.
+ * `reported` spans continuations of one bridge and holds what each call has
+ * already been reported as. A park can hand off before a call's
+ * message_delta arrives; the resumed response then sees that delta and
+ * reports only the growth over the earlier snapshot, so nothing is counted
+ * twice and the final output tokens are not lost.
  *
- * A call belongs to the response that saw it first; `seenCalls` spans the
- * continuations of one bridge. A later response does not report it again: not
- * a parallel tool call of the same message, not a message_delta that came
- * after a park handed off, not usage without a message id. A response that
- * saw no call of its own reports no usage, and OpenCode keeps the size it
- * measured last.
+ * Output tokens add up over the calls of a response. Prompt tokens don't:
+ * OpenCode reads them as the size of the context, and compacts when they
+ * reach the model's input limit, so they are the last call's prompt (the
+ * context as it stands), not the sum of every call's prompt.
  */
 export class TurnUsageTracker {
-  private readonly calls = new Map<string, OpenAIUsage>();
+  private readonly byId = new Map<
+    string,
+    { baseline: OpenAIUsage | null; max: OpenAIUsage }
+  >();
+  private anonymous: OpenAIUsage | null = null;
 
-  constructor(private readonly seenCalls: Set<string>) {}
+  constructor(private readonly reported: Map<string, OpenAIUsage>) {}
 
   add(usage: OpenAIUsage, messageId: string | null): void {
-    if (!messageId) return;
-    const seen = this.calls.get(messageId);
-    if (!seen && this.seenCalls.has(messageId)) return;
-    this.seenCalls.add(messageId);
-    this.calls.set(messageId, seen ? maxUsage(seen, usage) : usage);
-  }
-
-  /** Claude Code compacted the conversation: the calls before no longer describe it. */
-  compacted(): void {
-    this.calls.clear();
+    if (!messageId) {
+      this.anonymous = addOpenAIUsage(this.anonymous, usage);
+      return;
+    }
+    let entry = this.byId.get(messageId);
+    if (!entry) {
+      const baseline = this.reported.get(messageId) ?? null;
+      entry = { baseline, max: baseline ?? usage };
+      this.byId.set(messageId, entry);
+    }
+    entry.max = maxUsage(entry.max, usage);
+    this.reported.set(messageId, entry.max);
   }
 
   total(): OpenAIUsage | null {
+    let sum = this.anonymous ? { ...this.anonymous } : null;
     let last: OpenAIUsage | null = null;
-    for (const usage of this.calls.values()) last = usage;
-    return last ? { ...last } : null;
+    for (const { baseline, max } of this.byId.values()) {
+      last = max;
+      const growth = usageGrowth(max, baseline);
+      if (growth) sum = addOpenAIUsage(sum, growth);
+    }
+    if (!sum || !last) return sum;
+    return withPromptOf(sum, last);
   }
+}
+
+/** `usage` with the prompt side (context size) taken from `call`. */
+function withPromptOf(usage: OpenAIUsage, call: OpenAIUsage): OpenAIUsage {
+  const { prompt_tokens_details: _dropped, ...rest } = usage;
+  return {
+    ...rest,
+    prompt_tokens: call.prompt_tokens,
+    total_tokens: call.prompt_tokens + usage.completion_tokens,
+    ...(call.prompt_tokens_details
+      ? { prompt_tokens_details: { ...call.prompt_tokens_details } }
+      : {}),
+  };
 }
 
 /** Count a replayed SDK assistant message only once across tool continuations. */
@@ -303,27 +358,27 @@ export function addUniqueAssistantUsage(
 }
 
 /**
- * A response's usage: its call's (TurnUsageTracker), with the cost and
- * per-model breakdown of the SDK `result` when one came.
+ * Combine the per-response accumulated usage (one entry per Anthropic API
+ * call seen during this HTTP response) with the SDK `result` snapshot.
  *
- * The result's tokens are never the response's: `usage` sums every call of
- * the turn and `modelUsage` every call of the session, a resumed one starting
- * from the totals its transcript saved. Reported as the context size, a turn
- * that failed before its first call made OpenCode see a 1M chat at 64M and
- * compact before every message. A response without a call reports nothing.
+ * The accumulated value is the correct per-response accounting; the result
+ * snapshot is cumulative for the whole Claude query (all prior turns of a
+ * resumed/continued session included) and would double-count. It is only a
+ * fallback for turns where no assistant events were observed, plus a donor
+ * for cost/model breakdown metadata.
  */
 export function resolveTurnUsage(
-  call: OpenAIUsage | null,
+  accumulated: OpenAIUsage | null,
   result: OpenAIUsage | null,
 ): OpenAIUsage | null {
-  if (!call) return null;
-  if (!result) return call;
+  if (!accumulated) return result;
+  if (!result) return accumulated;
   return {
-    ...call,
-    ...(call.cost_usd === undefined && result.cost_usd !== undefined
+    ...accumulated,
+    ...(accumulated.cost_usd === undefined && result.cost_usd !== undefined
       ? { cost_usd: result.cost_usd }
       : {}),
-    ...(call.model_usage === undefined && result.model_usage !== undefined
+    ...(accumulated.model_usage === undefined && result.model_usage !== undefined
       ? { model_usage: result.model_usage }
       : {}),
   };

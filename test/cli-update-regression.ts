@@ -332,6 +332,8 @@ async function main() {
         const age = Date.now() - Date.parse(readCliUpdateRecord(env)!.at);
         assert.ok(Math.abs(age - minutes * 60_000) < 30_000, `the claim is ${Math.round(age / 1000)} s old`);
         const runs = updates();
+        const dump = (label: string) => console.log(`[debug ${label}]`, JSON.stringify({ now: Date.now(), record: readCliUpdateRecord(env), calls: native.calls().slice(-8).map((c: any) => ({ args: c.args.join(" "), at: c.at, pid: c.pid })) }));
+        dump("after kill");
         const stopNow = startClaudeCliAutoUpdate({ env });
         try {
           if (holds) await sleep(500);
@@ -339,6 +341,7 @@ async function main() {
         } finally {
           stopNow();
         }
+        dump("at assert");
         if (holds) assert.equal(updates(), runs, "a minute-old claim still holds");
         else assert.equal(updates(), runs + 1, "an abandoned claim expires");
       });
