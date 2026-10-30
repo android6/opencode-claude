@@ -85,7 +85,8 @@ async function main() {
     assert.equal(await resolveClaudeCli(missEnv), cliIn(empty));
     later.set({ version: "2.1.301" });
     assert.equal((await detectClaudeCode({ binaryPath: cliIn(empty) })).version, "2.1.301", "the new install runs");
-    assert.equal(later.calls().length, 2, "the new install's own starts: version and sign-in");
+    // Off Windows the resolver first proves the install by running `--version` (executable-path.ts probeClaude).
+    assert.equal(later.calls().length, process.platform === "win32" ? 2 : 3, "the new install's own starts: version and sign-in");
     resetClaudeCliResolutionCache();
 
     // Superseded login child: its late exit must not fail the current flow.
