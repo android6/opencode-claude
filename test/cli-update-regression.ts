@@ -319,10 +319,15 @@ async function main() {
         native.set({ version: "2.1.296", update: undefined, delayMs: 3000 });
         let killed = false;
         try {
+          const runsBefore = updates();
           const earlier = await world.secondProcess({ clockShiftMs: -minutes * 60_000, env: otherEnv });
           await earlier.start({ cliAutoUpdate: true });
           await waitFor(() => readCliUpdateRecord(env)?.outcome.pid === earlier.pid, 15_000);
           assert.equal(readCliUpdateRecord(env)?.outcome.pid, earlier.pid, "the earlier process claimed the run");
+          // Killed mid-run: the claim is written before the run starts, so wait for its `claude update` too, or
+          // that start lands after the count below.
+          await waitFor(() => updates() > runsBefore, 15_000);
+          assert.equal(updates(), runsBefore + 1, "the earlier process started `claude update`");
           await earlier.kill();
           killed = true;
         } finally {
