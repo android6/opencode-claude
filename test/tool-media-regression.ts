@@ -81,10 +81,12 @@ async function main() {
       // and the text file inlined.
       const chat = opencode.newChat();
       const png = testPng("user-attached");
+      // Absolute paths of the platform: a Windows path is relative on Linux and would be resolved against the cwd.
+      const work = process.platform === "win32" ? "C:\\work\\" : "/work/";
       await opencode.say(chat, "what do they say?", [
-        { mediaType: "image/png", data: png, name: "shot.png", path: "C:\\work\\shot.png" },
-        { mediaType: "application/pdf", data: PDF, name: "doc.pdf", path: "C:\\work\\doc.pdf" },
-        { mediaType: "text/plain", data: Buffer.from("kiwi").toString("base64"), name: "note.txt", path: "C:\\work\\note.txt" },
+        { mediaType: "image/png", data: png, name: "shot.png", path: `${work}shot.png` },
+        { mediaType: "application/pdf", data: PDF, name: "doc.pdf", path: `${work}doc.pdf` },
+        { mediaType: "text/plain", data: Buffer.from("kiwi").toString("base64"), name: "note.txt", path: `${work}note.txt` },
       ]);
       const from = claude.queries.length;
       assert.ok((await opencode.turn(chat)).ok);
@@ -92,7 +94,7 @@ async function main() {
       assert.equal(more.length, 0, "one prompt");
       const blocks = prompt!.content as Array<Record<string, any>>;
       assert.deepEqual(blocks.map((b) => b.type), ["text", "image", "text", "document", "text"]);
-      assert.match(blocks[0]!.text, /what do they say\?[\s\S]*Attached file: C:\\work\\shot\.png/);
+      assert.match(blocks[0]!.text, new RegExp(`what do they say\\?[\\s\\S]*Attached file: ${`${work}shot.png`.replace(/[\\.]/g, "\\$&")}`));
       assert.equal(blocks[1]!.source.data, png);
       assert.equal(blocks[3]!.source.media_type, "application/pdf");
       assert.equal(blocks[3]!.source.data, PDF);
