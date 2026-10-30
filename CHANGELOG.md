@@ -1,5 +1,105 @@
 # Changelog
 
+## Unreleased
+
+- **Forks start from a copy of the parent's transcript**: a forked chat
+  used to send its whole history to Claude as text, writing the prompt cache
+  again; now its first turn copies the parent's Claude transcript (the
+  record uuids kept) up to the last message the fork shows, so the fork
+  reads the parent's cache and Claude sees exactly the fork's screen: a fork
+  through a tool step gets the step's result from the copy, a fork made
+  while the parent was answering gets the question only. A revert or an
+  edit no longer branches the transcript in place: the turn copies it up to
+  the revert point into the next version, and the old version keeps what was
+  reverted, so a fork made before the revert still finds its history. A
+  fork's first turn waits at most 10 s for OpenCode
+  (`OPENCODE_CLAUDE_OPENCODE_READ_MS`); a fork that could not copy its
+  parent, and an empty revert copy, start as text with a warning line in the
+  reasoning.
+- **Sessions resume by name, not by guessing**: the plugin kept a record of
+  every chat (`sessions.json`) and matched OpenCode's history against it by
+  text fingerprints, which went wrong on a reverted turn asked again, a chat
+  that came back from another model, a retried turn, or a lost record. Now
+  OpenCode's own message ids name the Claude transcript of a chat and every
+  record in it: the plugin reads the transcript, finds the last record the
+  current history names and resumes right after its turn, so a revert
+  continues from the turn before the reverted one, a retry gets a new
+  record, and turns another model answered reach Claude as text. No
+  record file is kept; an existing `sessions.json` is read once per chat
+  and never changed. Requires Claude Code 2.1.300 or later and OpenCode
+  2.0.19 or later.
+- **Chats from earlier releases keep their Claude session**: the first
+  turn of a chat 1.7.0 or earlier served copies the transcript that release
+  kept for it under the chat's new name, when its record in
+  `sessions.json` still matches the chat, and continues from there;
+  otherwise the history goes as text once. Neither `sessions.json` nor the
+  old transcript is changed, so going back to an earlier release finds
+  both: the chat continues its old transcript there, and the turns made
+  since reach Claude as text once (so do that release's turns on the way
+  forward again). A chat on an old `…[1m]` id of 1.6.0 (Fable 5, Opus 5
+  and later) asks for its model once, as on 1.7.0. After going back to
+  1.6.0 such a chat shows "Model unavailable" until its model is picked
+  again: 1.6.0 names them with `[1m]`; going back to 1.7.0 needs nothing.
+- **Breaking: requests the plugin cannot name are refused**: a request
+  without OpenCode's session id (the plugin no longer keys a chat by its
+  messages), a chat request that did not pass the `context` hook, and a
+  message that failed sixteen times in a row are refused with
+  `x-should-retry: false`; a chat turn on a Claude Code older than 2.1.300
+  gets a 503 that says what to update. Titles, summaries and `generate`
+  without a session run as before.
+- **A turn says how it ran**: a turn that runs differently from the usual
+  adds a line to its reasoning, above the answer: `[claude-code warning]`
+  when it goes without the prompt cache (the request did not match
+  OpenCode's message list and ran once outside the chat's Claude session;
+  the session could not be continued), `[claude-code]` for an expected
+  step (messages Claude had not seen went as text, the first turn after a
+  compaction, a rebuilt tool step).
+- **One record per message**: queued messages, turns another model answered
+  and the checkpoint after a compaction used to reach Claude glued into one
+  prompt, and only the last message got a record of its own, so the next turn
+  could not tell where they ended. Each queued message and the checkpoint now
+  go as a record of their own without a turn (`shouldQuery: false`), named
+  after their OpenCode message, the last one with the turn; the turns another
+  model answered go as one such record, in OpenCode's own form for a
+  serialized part of a conversation (`<recent-context>` with `[User]:` and
+  `[Assistant]:` lines), with the assistant's replies as Claude's own. The
+  records go to Claude Code one at a time, each after it confirms the one
+  before (sent together, it joins them into one under the last one's name).
+  The next turn finds them all and reads them from the cache. Images and
+  documents in those turns reach Claude as themselves, not as
+  "[image/png omitted]".
+- **A chat turn reads OpenCode's message list**: the prompt, the turns the
+  transcript missed, tool results, messages sent while a tool ran, the system
+  prompt and the tools now come from the list OpenCode's `context` hook hands
+  the plugin, the same list whose ids name the transcript's records, instead
+  of the HTTP body matched against that list by counting user messages. A
+  tool's images and PDFs stay with its result. A summary, a title and a
+  generate request still read their HTTP body, which is what OpenCode asks.
+- **Only OpenCode compacts the chat**: Claude Code's own auto-compaction was
+  meant to be off for summaries and on for chat turns, but the plugin set it
+  through an option the Agent SDK does not have, so the CLI compacted on its
+  own at its own threshold, on top of OpenCode's compaction. A compaction
+  boundary the CLI writes into the transcript blocks every resume before it,
+  so a revert past it had to transfer the whole history as text. The CLI's
+  auto-compaction is now off for every request through the `autoCompactEnabled`
+  setting; an overflow still comes back to OpenCode as a context overflow,
+  which compacts and retries.
+- **The Claude Code CLI keeps itself current**: Claude Code's own updater
+  runs only from its interactive screen, so a CLI driven through the Agent
+  SDK stayed on its install-day version and new models (Sonnet 5.5, Haiku 5.5)
+  never showed up. The plugin now runs `claude update` in the background about
+  once an hour (once across all OpenCode servers on the machine), checks the
+  result with `claude --version`, and records the outcome in
+  `~/.local/share/opencode-claude/cli-update.json`. Off with
+  `cliAutoUpdate: false` in the plugin options or Claude Code's
+  `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`.
+- **A CLI that does not start is looked for again**: when a turn cannot
+  launch the CLI (an update is replacing it, an install changed its path,
+  another program holds the file), the plugin forgets the path it had found
+  and answers with a server error; OpenCode retries it a few seconds later
+  and the retry finds the CLI anew.
+
 ## 1.7.0 - 2026-10-30
 
 - **Background compaction works with Claude**: with OpenCode's

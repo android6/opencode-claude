@@ -1,37 +1,40 @@
 /**
- * Regression: reverting or editing in OpenCode rewinds the Claude session
- * instead of resuming a history OpenCode no longer has.
- * - History back at an earlier turn → a fork cut at that turn's leaf,
- *   resumed plainly. Boundaries from before a fork are dropped; going back
- *   to one transfers the history.
- * - History that matches no turn → binding dropped, history transferred.
- * - Normal flows never misfire: follow-ups, a retried request, a model
- *   switch, tool-result continuations, steering, a rebuilt tool step, Plan
- *   mode reminders, a tool's image, a turn another model answered, title
- *   requests. The history is counted by the user's own messages.
+ * Regression: reverting or editing in OpenCode resumes the Claude transcript
+ * at the right record instead of continuing a history OpenCode no longer
+ * has. The resume point comes from the ids in OpenCode's message list
+ * (turn-point.ts): the end of the turn of the last message the transcript
+ * holds; what the list has after it goes as a record of its own without a
+ * turn (a new transcript: the history as text).
+ * - A revert or an edit: the point is the answer before the undone turn,
+ *   and the turn copies the transcript up to it into the next version
+ *   (`resume` + `forkSession` + `sessionId`); the old version keeps the
+ *   undone turn, for a fork made before the revert.
+ * - A retry of a failed turn: the same version; the record takes the next
+ *   attempt number and the point is before the failed attempt.
+ * - Normal flows never misfire: follow-ups, a model switch, Plan mode
+ *   reminders, title requests, tool-result continuations, steering, a
+ *   rebuilt tool step.
+ * - A history whose early message changed: a revert to the chat's start,
+ *   copied up to the record the transcript starts with, history as text.
  *
  * On the simulators (test/simulators/): a revert or an edit is the user's
- * (`undoBefore`, then a new message); main forks through the SDK's own
- * `forkSession` on the files Claude Code wrote, and the copy's records name
- * the record they were cut at (`forkedFrom`). A retried request is OpenCode
- * retrying a failed one: a Claude Code process that did not start
- * (`state.failures` "spawn": nothing written), or a model call that failed
- * after the CLI wrote the prompt (`overloaded`). A transcript gone is the
- * user pruning Claude's projects folder. A history that matches no turn is a
- * chat another model compacted (`compactElsewhere`). A rebuilt tool step is a
- * tool that ran longer than the parked turn's TTL (a tool output that is a
- * promise: OpenCode sends the results once it settled).
- * A tool's image is OpenCode's text-less message after the results
- * (`toolFiles`); another model's turn `otherModelAnswer`. The boundaries are
- * read from main's record of the chat (`session-store`), a rewind from the
- * plugin's journal.
+ * (`undoBefore`, then a new message); the turn's point is the query's
+ * `resume` / `resumeSessionAt`, its record's name the query's `trigger`. The
+ * end of a turn is the transcript's last chain record right after it
+ * (`claude.leafOf`). A failed turn is a model call that failed after the CLI
+ * wrote the prompt (`serverError`, retried by OpenCode; `permission`, not
+ * retried). A rebuilt tool step is a tool that ran longer than the parked
+ * turn's TTL (a tool output that is a promise: OpenCode sends the results
+ * once it settled). An early message changed: the user edits the chat's
+ * first message and another model answers it. A copy is the query's
+ * `forkSession` with the new version as `sessionId`; the plan's line in the
+ * journal names it (`copiedFrom`, `copyFor`).
  *
- * Run: bun test/revert-edit-main-regression.ts
+ * Run: bun test/revert-edit-regression.ts
  */
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
 
-import { testPng } from "./simulators/opencode.ts";
+import { contentText } from "./simulators/claude-code.ts";
 import { createWorld, pluginModule } from "./simulators/world.ts";
 
 async function main() {
@@ -39,240 +42,206 @@ async function main() {
   const { opencode, claude } = world;
   try {
     await opencode.startPlugin();
-    const store = await pluginModule("session-store");
+    const { FIRST_EPOCH, TRANSCRIPT_START_NAME, stepRecordName, transcriptName, userRecordName } = await pluginModule("names");
 
     const chat = opencode.newChat();
-    const forks = () =>
-      world.journal().filter((line) => line.includes("resuming a fork of the Claude session")).map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { from: string; fork: string });
-    /** The fork the latest turn made: `<source>@<the record it was cut at>`, from the copy's `forkedFrom`. */
-    const forkOf = (fork: string) => {
-      const cut = claude.records(fork).filter((r) => r.forkedFrom).at(-1)!.forkedFrom as { sessionId: string; messageUuid: string };
-      return `${cut.sessionId}@${cut.messageUuid}`;
-    };
-    /** The record a fork's copy of `uuid` got. */
-    const copyOf = (fork: string, uuid: string) => claude.records(fork).find((r) => r.forkedFrom?.messageUuid === uuid)!.uuid!;
-    const where = () => (store.getSessionTurns(chat) as Array<{ sessionId?: string; leafUuid?: string }>).map((t) => `${t.sessionId}:${t.leafUuid}`);
-    const leaves = () => (store.getSessionTurns(chat) as Array<{ leafUuid?: string }>).map((t) => t.leafUuid);
-    /** How many of the user's messages each boundary's history holds (the plugin's count of the history). */
-    const counts = () => (store.getSessionTurns(chat) as Array<{ count: number }>).map((t) => t.count);
-    /** The boundaries the plugin went back to, from its journal: the index of each. */
-    const wentBack = () =>
-      world.journal().filter((line) => line.includes("OpenCode history went back; resuming from an earlier turn")).map((line) => (JSON.parse(line.slice(line.indexOf("{"))) as { turn: number }).turn);
-    /** The user sends `text` and the turn answers: what the turn's last query resumed, the fork it made, whether the history went as text. */
+    const V = (version: number) => transcriptName(chat, FIRST_EPOCH, version);
+    const NAME = V(1);
+    /** The version the chat's turns continue: a revert moves it on. */
+    let current = NAME;
+    /**
+     * The end of the turn that answered each message (by its text): the leaf, right after the turn, of the
+     * transcript the turn wrote. A copy keeps the source's uuids, so an end is the same record in both.
+     */
+    const ends = new Map<string, string>();
+    const chatQueries = () => claude.queries.filter((q) => q.kind === "chat");
+    /** The transcript a query wrote: a new one or a copy under `sessionId`, else the one it resumed. */
+    const writtenBy = (query: (typeof claude.queries)[number]) => String(query.params.forkSession || !query.params.resume ? query.params.sessionId : query.params.resume);
+    /** The user sends `text` and the turn answers: what its last query resumed, at which record, under which name, whether the history went as text. */
     const send = async (text: string, options: Parameters<typeof opencode.turn>[1] = {}) => {
       const id = await opencode.say(chat, text);
-      const forksBefore = forks().length;
+      const from = claude.queries.length;
       const turn = await opencode.turn(chat, options);
       assert.ok(turn.ok, `${text}: ${turn.requests.map((r) => r.status).join(",")}`);
-      const query = claude.queries.filter((q) => q.kind === "chat").at(-1)!;
-      assert.equal("resumeSessionAt" in query.params, false);
-      const made = forks().slice(forksBefore);
-      assert.ok(made.length <= 1, `one fork at most: ${JSON.stringify(made)}`);
+      const query = chatQueries().at(-1)!;
+      ends.set(text, claude.leafOf(writtenBy(query))!.uuid!);
       return {
         id,
         turn,
         query,
-        leaf: store.getSessionLeafUuid(chat) as string,
-        // Transferred: this query's prompt carries the history (not a resumed record of an earlier one).
-        r: { resume: query.params.resume, fork: made[0] ? forkOf(made[0].fork) : undefined, transferred: JSON.stringify(query.input.map((i) => i.content)).includes("<conversation_history>") },
+        queries: claude.queries.slice(from),
+        r: {
+          resume: query.params.resume,
+          at: query.params.resumeSessionAt,
+          fresh: query.params.sessionId,
+          copy: query.params.forkSession === true,
+          uuid: query.trigger,
+          // Transferred: this query's prompt carries the history as text, or the missed messages as a record of
+          // their own without a turn, in OpenCode's form for a serialized part of a conversation.
+          transferred:
+            JSON.stringify(query.input.map((i) => i.content)).includes("<conversation_history>") ||
+            query.input.some((i) => i.noTurn && contentText(i.content).includes("<recent-context>")),
+        },
       };
     };
     const lines = (view: string) => view.split("\n");
 
-    // Three turns build the session; each resumes it as is.
-    const t1 = await send("Q-one");
-    assert.equal(t1.r.resume, undefined);
-    const first = store.getForeignSessionId(chat) as string;
-    const t2 = await send("Q-two");
-    assert.deepEqual(t2.r, { resume: first, fork: undefined, transferred: false });
-    const t3 = await send("Q-three");
-    assert.deepEqual(t3.r, { resume: first, fork: undefined, transferred: false });
-    assert.deepEqual(leaves(), [t1.leaf, t2.leaf, t3.leaf]);
-    // The history is counted by the user's messages alone; the answers between them do not count.
-    assert.deepEqual(counts(), [1, 2, 3]);
+    // Three turns build the transcript; each resumes at the latest answer.
+    const t1 = await send("u1");
+    assert.deepEqual([t1.r.fresh, t1.r.resume, t1.r.transferred], [NAME, undefined, false]);
+    assert.equal(t1.r.uuid, userRecordName(t1.id, 1));
+    const t2 = await send("u2");
+    assert.deepEqual([t2.r.resume, t2.r.at, t2.r.transferred], [NAME, ends.get("u1"), false]);
+    const t3 = await send("u3");
+    assert.deepEqual([t3.r.resume, t3.r.at, t3.r.transferred], [NAME, ends.get("u2"), false]);
 
-    // Revert of the last turn, new prompt → a fork cut at the second turn's
-    // leaf. The undone turn descends from it, so a plain resume would bring it back.
+    // Revert of the last turn, new prompt: the point is the answer to u2, and
+    // the turn copies version 1 up to it into version 2; version 1 keeps the
+    // undone turn, the copy holds none of it.
     opencode.undoBefore(chat, t3.id);
-    const t3b = await send("R-three");
-    const fork1 = t3b.r.resume as string;
-    assert.deepEqual(t3b.r, { resume: fork1, fork: `${first}@${t2.leaf}`, transferred: false });
-    assert.deepEqual(wentBack(), [1], "the history ends at the second boundary");
-    assert.deepEqual(counts(), [1, 2, 3]);
-    assert.ok(!lines(t3b.query.view).includes("Q-three"), `Claude still sees the undone message: ${t3b.query.view}`);
-    assert.equal(store.getForeignSessionId(chat), fork1);
-    // The current boundary moves to the fork's copy of that leaf; the older
-    // one keeps pointing into the first session.
-    assert.deepEqual(where(), [`${first}:${t1.leaf}`, `${fork1}:${copyOf(fork1, t2.leaf)}`, `${fork1}:${t3b.leaf}`]);
+    const t3b = await send("u3 edited");
+    assert.deepEqual([t3b.r.resume, t3b.r.at, t3b.r.fresh, t3b.r.copy, t3b.r.transferred], [NAME, ends.get("u2"), V(2), true, false]);
+    current = V(2);
+    assert.ok(claude.records(NAME).some((r) => r.uuid === userRecordName(t3.id, 1)), "version 1 keeps the undone turn");
+    assert.ok(!claude.records(current).some((r) => r.uuid === userRecordName(t3.id, 1)), "the copy does not");
+    assert.ok(claude.records(current).some((r) => r.uuid === ends.get("u2")), "the copy holds the turns before the revert, under the same uuids");
+    assert.ok(!lines(t3b.query.view).includes("u3"), `Claude still sees the undone message: ${t3b.query.view}`);
 
-    // Normal follow-up after the rewind resumes the fork as is.
-    const t4 = await send("Q-four");
-    assert.deepEqual(t4.r, { resume: fork1, fork: undefined, transferred: false });
+    // Normal follow-up after the edit resumes the copy at the new answer.
+    const t4 = await send("u4");
+    assert.deepEqual([t4.r.resume, t4.r.at, t4.r.copy, t4.r.transferred], [V(2), ends.get("u3 edited"), false, false]);
 
-    // Back one turn inside the fork → fork of the fork, cut at R-three's leaf.
+    // Back one turn again: the point is still the answer to "u3 edited", and version 3 is a copy of version 2.
     opencode.undoBefore(chat, t4.id);
-    const t4b = await send("R-four");
-    const fork2 = t4b.r.resume as string;
-    assert.deepEqual(t4b.r, { resume: fork2, fork: `${fork1}@${t3b.leaf}`, transferred: false });
-    assert.deepEqual(where(), [`${first}:${t1.leaf}`, `${fork1}:${copyOf(fork1, t2.leaf)}`, `${fork2}:${copyOf(fork2, t3b.leaf)}`, `${fork2}:${t4b.leaf}`]);
+    const t4b = await send("u4 edited");
+    assert.deepEqual([t4b.r.resume, t4b.r.at, t4b.r.fresh, t4b.r.copy, t4b.r.transferred], [V(2), ends.get("u3 edited"), V(3), true, false]);
+    current = V(3);
+    assert.ok(!lines(t4b.query.view).includes("u4"), `Claude sees no undone message: ${t4b.query.view}`);
 
-    // Rewind across one fork: the boundary lives in fork-1, the chat in
-    // fork-2. The new fork comes from fork-1.
-    opencode.undoBefore(chat, t3b.id);
-    const t3c = await send("S-three");
-    const fork3 = t3c.r.resume as string;
-    const fork1L2 = copyOf(fork1, t2.leaf);
-    assert.deepEqual(t3c.r, { resume: fork3, fork: `${fork1}@${fork1L2}`, transferred: false });
-    assert.deepEqual(where(), [`${first}:${t1.leaf}`, `${fork3}:${copyOf(fork3, fork1L2)}`, `${fork3}:${t3c.leaf}`]);
-
-    // Rewind across two forks (fork-1, fork-3): back to the first session.
-    opencode.undoBefore(chat, t2.id);
-    const t2d = await send("T-two");
-    const fork4 = t2d.r.resume as string;
-    assert.deepEqual(t2d.r, { resume: fork4, fork: `${first}@${t1.leaf}`, transferred: false });
-    assert.deepEqual(where(), [`${fork4}:${copyOf(fork4, t1.leaf)}`, `${fork4}:${t2d.leaf}`]);
-    assert.ok(!["Q-two", "R-three", "S-three", "R-four"].some((text) => lines(t2d.query.view).includes(text)), `Claude sees no undone message: ${t2d.query.view}`);
-
-    // A retry right after a fork whose turn failed before Claude wrote
-    // anything resumes that fork as is; nothing to cut. The Claude Code
-    // process does not start; OpenCode retries the request.
-    const t3d = await send("U-three");
-    assert.deepEqual(t3d.r, { resume: fork4, fork: undefined, transferred: false });
-    opencode.undoBefore(chat, t3d.id);
-    claude.state.failures = ["spawn"];
-    const queriesBefore = claude.queries.length;
-    const t3e = await send("V-three");
-    const fork5 = t3e.r.resume as string;
-    assert.equal(t3e.turn.requests.length, 2, "the request failed, OpenCode retried it");
-    const [failedQuery, retried] = claude.queries.slice(queriesBefore);
-    assert.equal(failedQuery!.outcome, "spawn");
-    assert.equal(failedQuery!.params.resume, fork5, "the failed attempt resumed the fork it made");
-    assert.equal(retried!.params.resume, fork5, "the retry resumed that fork as is");
-    assert.equal(forkOf(fork5), `${fork4}@${t2d.leaf}`);
-    assert.equal(forks().filter((f) => f.fork === fork5).length, 1, "one fork for both attempts");
-
-    // A rewind to a boundary whose session file is gone (the user pruned
-    // Claude's projects folder) → history as text.
-    assert.equal(where()[0], `${fork4}:${copyOf(fork4, t1.leaf)}`);
-    rmSync(claude.fileOf(fork4));
-    opencode.undoBefore(chat, t2d.id);
-    const t2z = await send("Z-two");
-    assert.deepEqual(t2z.r, { resume: undefined, fork: undefined, transferred: true });
-    const fresh = store.getForeignSessionId(chat) as string;
-    assert.equal(fresh, t2z.query.name);
+    // A turn that fails after the CLI wrote the prompt's record: OpenCode
+    // retries the same message, which gets the next attempt number and
+    // resumes before the failed attempt.
+    claude.state.failures = ["serverError"];
+    const t5 = await send("u5");
+    assert.equal(t5.turn.requests.length, 2, "the request failed, OpenCode retried it");
+    const [failed, retried] = t5.queries;
+    assert.equal(failed!.outcome, "serverError");
+    assert.deepEqual([failed!.params.resume, failed!.params.resumeSessionAt, failed!.trigger], [current, ends.get("u4 edited"), userRecordName(t5.id, 1)]);
+    assert.deepEqual(
+      [retried!.params.resume, retried!.params.resumeSessionAt, retried!.params.forkSession === true, retried!.trigger],
+      [current, ends.get("u4 edited"), false, userRecordName(t5.id, 2)],
+      "a retry stays in the same version",
+    );
+    assert.equal(lines(t5.query.view).filter((text) => text === "u5").length, 1, `Claude sees the retried message once: ${t5.query.view}`);
 
     // A model switch changes nothing.
     const opus = opencode.instances[0]!.provider.models.find((m: any) => /opus/.test(m.id))?.id as string;
     assert.ok(opus, "the catalog has an Opus model");
     opencode.state.modelID = opus;
-    const t3m = await send("M-three");
+    const t6 = await send("u6");
     opencode.state.modelID = undefined;
-    assert.equal(t3m.query.params.model, opus);
-    assert.deepEqual(t3m.r, { resume: fresh, fork: undefined, transferred: false });
+    assert.equal(t6.query.params.model, opus);
+    assert.deepEqual([t6.r.resume, t6.r.at, t6.r.transferred], [current, ends.get("u5"), false]);
 
-    // OpenCode retries the same request (the first attempt reached Claude,
-    // which wrote the prompt, but the model call failed): the retry goes back
-    // to where that attempt started.
-    claude.state.failures = ["overloaded"];
-    const retryFrom = claude.queries.length;
-    const t4n = await send("N-four");
-    assert.equal(t4n.turn.requests.length, 2, "the request failed, OpenCode retried it");
-    assert.equal(claude.queries[retryFrom]!.params.resume, fresh);
-    const fork6 = t4n.r.resume as string;
-    assert.deepEqual(t4n.r, { resume: fork6, fork: `${fresh}@${t3m.leaf}`, transferred: false });
-    assert.equal(lines(t4n.query.view).filter((text) => text === "N-four").length, 1, `Claude sees the retried message once: ${t4n.query.view}`);
-
-    // A Plan mode reminder before the prompt, and one after it.
+    // A Plan mode reminder before the prompt, and one after it: reminders are
+    // not messages of the chain.
     const reminder = "<system-reminder>\nYou are in Plan mode.\n</system-reminder>";
-    const beforePlan = counts().at(-1)!;
     opencode.between(chat, "synthetic", reminder);
-    const plan = await send("P-plan it");
-    assert.deepEqual(plan.r, { resume: fork6, fork: undefined, transferred: false });
-    await opencode.say(chat, "P-go");
+    const plan = await send("plan it");
+    assert.deepEqual([plan.r.resume, plan.r.at, plan.r.transferred], [current, ends.get("u6"), false]);
+    await opencode.say(chat, "go");
     opencode.between(chat, "synthetic", reminder);
     const go = await opencode.turn(chat);
     assert.ok(go.ok, "the turn with a reminder after the prompt");
-    assert.equal(claude.queries.at(-1)!.params.resume, fork6);
-    assert.equal(forks().length, 6, "no fork for a reminder");
-    assert.deepEqual(counts().slice(-2), [beforePlan + 1, beforePlan + 2], "a reminder is no message of the user's");
-    const session = store.getForeignSessionId(chat) as string;
+    assert.deepEqual(
+      [chatQueries().at(-1)!.params.resume, chatQueries().at(-1)!.params.resumeSessionAt, chatQueries().at(-1)!.params.forkSession === true],
+      [current, ends.get("plan it"), false],
+    );
+    ends.set("go", claude.leafOf(current)!.uuid!);
 
-    // A title request leaves the boundaries alone.
-    const before = JSON.stringify(store.getSessionTurns(chat));
+    // A title request leaves the transcript alone.
+    const before = claude.records(current).length;
     const title = await opencode.title(chat);
     assert.ok(title.title, "OpenCode titled the chat");
-    assert.equal(JSON.stringify(store.getSessionTurns(chat)), before);
+    assert.equal(claude.records(current).length, before);
+    assert.equal(claude.queries.at(-1)!.params.resume, undefined, "a title resumes nothing");
 
-    // Tool-result continuation, steering and a later follow-up.
+    // Tool-result continuation (the parked turn), with a message sent while
+    // the tool ran, then a follow-up that resumes after the turn's last record.
     claude.state.toolTurn = true;
-    const queriesBeforeTool = claude.queries.length;
-    const tool = await send("L-list files", { toolOutput: "a.txt", steer: "L-also count them" });
+    const tool = await send("list files", { toolOutput: "a.txt", steer: "also count them" });
     assert.equal(tool.turn.requests.length, 2, "one request with the call, one with its result");
-    assert.equal(claude.queries.length - queriesBeforeTool, 1, "continuation reuses the parked turn");
-    assert.deepEqual(tool.r, { resume: session, fork: undefined, transferred: false });
-    assert.equal((store.getSessionTurns(chat) as Array<{ leafUuid?: string }>).at(-1)!.leafUuid, claude.records(session).findLast((r) => r.type === "assistant")!.uuid);
-    const thanks = await send("L-thanks");
-    assert.deepEqual(thanks.r, { resume: session, fork: undefined, transferred: false });
-
-    // A tool's image: OpenCode sends it as a message of its own after the results; it is the tool's, not the user's.
-    const beforeImage = counts().at(-1)!;
-    claude.state.toolTurn = true;
-    const image = await send("I-take a screenshot", { toolOutput: "shot", toolFiles: [{ mime: "image/png", data: testPng("revert-edit") }] });
-    assert.deepEqual(image.r, { resume: session, fork: undefined, transferred: false });
-    const looked = await send("I-thanks");
-    assert.deepEqual(looked.r, { resume: session, fork: undefined, transferred: false });
-    assert.deepEqual(counts().slice(-2), [beforeImage + 1, beforeImage + 2], "the tool's image is no message of the user's");
-
-    // A turn another model answered: the history goes on past the latest boundary; the session is resumed as is
-    // and gets that turn.
-    const beforeOther = counts().at(-1)!;
-    const rewinds = wentBack().length;
-    await opencode.say(chat, "O-ask another model");
-    opencode.otherModelAnswer(chat, "O-the other model's answer");
-    const back = await send("O-back to Claude");
-    // Resumed, and the missed turn goes with the prompt as history.
-    assert.deepEqual(back.r, { resume: session, fork: undefined, transferred: true });
-    assert.ok(JSON.stringify(back.query.input.map((i) => i.content)).includes("O-the other model's answer"), "Claude gets the turn it missed");
-    assert.equal(counts().at(-1), beforeOther + 2);
-    assert.equal(wentBack().length, rewinds, "no rewind for a turn another model answered");
-
-    // A history that matches no turn: another model compacted the chat.
-    opencode.compactElsewhere(chat);
-    const n1 = await send("N-something else entirely");
-    assert.equal(n1.r.resume, undefined);
-    // The summary is the user message right before the prompt: it goes with the prompt, nothing else to transfer.
-    assert.ok(JSON.stringify(n1.query.input.map((i) => i.content)).includes("another model's summary"), "Claude gets the history OpenCode has");
-    assert.ok(world.journal().some((line) => line.includes("OpenCode history no longer matches the Claude session") && line.includes('"match":"diverged"')));
-    assert.equal(store.getForeignSessionId(chat), n1.query.name, "the new turn binds again");
-    assert.deepEqual(leaves(), [n1.leaf]);
-    const rebound = n1.query.name;
+    assert.equal(tool.queries.length, 1, "continuation reuses the parked turn");
+    assert.deepEqual([tool.r.resume, tool.r.at], [current, ends.get("go")]);
+    const thanks = await send("thanks");
+    // The CLI took the message sent mid-turn into the turn (an attachment named after it): nothing is missed.
+    assert.deepEqual([thanks.r.resume, thanks.r.at, thanks.r.transferred], [current, ends.get("list files"), false]);
 
     // Tool results with no parked turn (reaped past its TTL while the tool
-    // ran): the turn is rebuilt around them, still resumed.
+    // ran): the step is rebuilt as a record of its own, after the turn's last record.
     process.env.OPENCODE_CLAUDE_PARKED_TURN_TTL_MS = "100";
     claude.state.toolTurn = true;
-    const late = await send("W-run it", {
+    let reapedAt: string | undefined;
+    const late = await send("run it", {
       toolOutput: async () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
+        reapedAt = claude.leafOf(current)!.uuid;
         return "late";
       },
     });
     delete process.env.OPENCODE_CLAUDE_PARKED_TURN_TTL_MS;
     assert.ok(world.journal().some((line) => line.includes("reaping parked turn past its TTL")));
     assert.ok(world.journal().some((line) => line.includes("tool results arrived with no parked turn")));
-    assert.deepEqual(late.r, { resume: rebound, fork: undefined, transferred: false });
-    // The session saw the turn that made the call start, so nothing was missed: the step is relayed as Claude's own
-    // (#74's control, 1.6.1).
-    assert.match(JSON.stringify(late.query.input.map((i) => i.content)), /Your previous step called the tools below/);
+    assert.ok(reapedAt && reapedAt !== ends.get("thanks"), "the reaped turn's records end past the call");
+    const call = late.turn.requests[0]!.reply!.toolCalls[0]!.id;
+    assert.deepEqual([late.r.resume, late.r.at, late.r.uuid], [current, reapedAt, stepRecordName([call], 1)]);
 
-    // The Claude Code process that did not start (the retry block): the SDK reports its exit in the stream, and
-    // the plugin takes it as a turn that failed fast — a warning, no error.
-    assert.ok(world.journal().some((line) => line.includes("turn failed fast") && line.includes("Claude Code process exited with code 1")));
-    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+    // A message whose turn failed after its record was written, then another
+    // one: the two stand together as the latest user turn. The transcript
+    // holds the first; the prompt is only the second, or Claude reads the
+    // first twice.
+    claude.state.failures = ["permission"];
+    const u7 = await opencode.say(chat, "u7");
+    const failedU7 = await opencode.turn(chat);
+    assert.ok(!failedU7.ok && failedU7.requests.length === 1, `u7 failed, not retried: ${failedU7.requests.map((r) => r.status).join(",")}`);
+    assert.equal(chatQueries().at(-1)!.trigger, userRecordName(u7, 1));
+    const failedEnd = claude.leafOf(current)!.uuid!;
+    const u8 = await send("u8");
+    assert.deepEqual([u8.r.resume, u8.r.at, u8.r.uuid], [current, failedEnd, userRecordName(u8.id, 1)]);
+    assert.ok(claude.chainTo(current, failedEnd).some((r) => r.uuid === userRecordName(u7, 1)), "the point is the end of u7's turn");
+    const prompt = u8.query.input.filter((i) => !i.noTurn).map((i) => JSON.stringify(i.content));
+    assert.equal(prompt.length, 1);
+    assert.ok(prompt[0]!.includes("u8") && !prompt[0]!.includes("u7"), `the failed message is in the transcript, not again in the prompt: ${prompt[0]}`);
+
+    // A history whose early message changed: nothing of it is in the
+    // transcript before the new prompt, a revert to the chat's start: the
+    // turn copies the transcript up to the record it starts with into the
+    // next version, history as text.
+    opencode.undoBefore(chat, t1.id);
+    await opencode.say(chat, "something else entirely");
+    opencode.otherModelAnswer(chat, "a1");
+    const changed = await send("u2 again");
+    assert.deepEqual([changed.r.resume, changed.r.at, changed.r.fresh, changed.r.copy, changed.r.transferred], [current, TRANSCRIPT_START_NAME, V(4), true, true]);
+    assert.ok(JSON.stringify(changed.query.input.map((i) => i.content)).includes("something else entirely"), "Claude gets the history OpenCode has");
+    assert.ok(!lines(changed.query.view).includes("u1"), `Claude sees none of the old history: ${changed.query.view}`);
+
+    // The journal: each turn's plan, and the one error of the failures the test made.
+    const journal = world.journal();
+    assert.ok(journal.some((line) => line.includes("resuming the chat's Claude transcript") && line.includes(`"point":"${TRANSCRIPT_START_NAME}"`)), "the plan of the changed history is in the journal");
+    const copies = journal
+      .filter((line) => line.includes("resuming the chat's Claude transcript") && line.includes('"copyFor"'))
+      .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { transcript: string; copiedFrom: string; copyFor: string });
+    assert.deepEqual(
+      copies.map((c) => [c.copiedFrom, c.transcript, c.copyFor]),
+      [[V(1), V(2), "revert"], [V(2), V(3), "revert"], [V(3), V(4), "revert"]],
+      "the journal names each copy: from which version, into which, for a revert",
+    );
+    const errors = journal.filter((line) => /level=error/.test(line));
+    assert.deepEqual(errors.filter((line) => !/Internal server error|permission to use this model/.test(line)), [], "no other error in the plugin's journal");
   } finally {
     await world.dispose();
   }
-  console.log("ok - revert/edit regression passed");
+  console.log("ok — revert/edit regression passed");
 }
 
 main().then(

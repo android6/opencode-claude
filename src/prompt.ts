@@ -1,9 +1,27 @@
 /**
- * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
- * including text, images, and PDF/document attachments.
+ * Build Claude Agent SDK prompts from a request's messages, including text,
+ * images, and PDF/document attachments.
+ *
+ * Every builder reads the messages in the form of OpenCode's message list
+ * (LLM.Message: `text`, `media`, `tool-call`, `tool-result` parts), the
+ * form the `context` hook hands the plugin. A chat
+ * turn's messages are that list; a summary, title or generate request is
+ * read from its OpenAI body, put into the same form first (list-content.ts).
  */
-import { createHash } from "node:crypto";
 import { currentHost } from "./host.js";
+import { log } from "./log.js";
+import { ORIGINAL_ID_KEY } from "./names.js";
+
+/** A content part of a list message: `text`, `media`, `tool-call`, `tool-result`, `reasoning`. */
+export type ListPart = { type: string } & Record<string, any>;
+
+/** A message in the form of OpenCode's list (LLM.Message), the form every builder reads. */
+export type ConversationMessage = {
+  id?: string;
+  role: string;
+  content: ListPart[];
+  metadata?: Record<string, unknown>;
+};
 
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
@@ -24,15 +42,29 @@ export type SdkUserPrompt = {
   type: "user";
   message: { role: "user"; content: string | AnthropicContentBlock[] };
   parent_tool_use_id: null;
+  /** The transcript record's uuid, named by the plugin (names.ts). */
+  uuid?: string;
+  /**
+   * A record without a turn: the CLI writes it to the transcript and the
+   * next record of the stream carries the turn (probes 5, 6, 23).
+   */
+  shouldQuery?: false;
 };
+
+/** The prompt as a record with this uuid; an empty text prompt still needs some content. */
+export function withUuid(prompt: string | SdkUserPrompt, uuid: string): SdkUserPrompt {
+  if (typeof prompt === "string") {
+    return { type: "user", message: { role: "user", content: prompt || " " }, parent_tool_use_id: null, uuid };
+  }
+  return { ...prompt, uuid };
+}
 
 function parseDataUrl(url: string): {
   mediaType: string;
   data: string;
 } | null {
-  // Allow extra parameters between media type and base64
-  // (e.g. data:image/png;name=photo.png;base64,...).
-  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/i.exec(url.trim());
+  // OpenCode 2.0.32 writes `data:<mime>;base64,...` and no other parameter.
+  const match = /^data:([^;,]+)?;base64,(.+)$/i.exec(url.trim());
   if (!match) return null;
   return {
     mediaType: (match[1] || "application/octet-stream").toLowerCase(),
@@ -152,7 +184,7 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
     return;
   }
 
-  // AI SDK / Anthropic-shaped image parts (not OpenAI image_url).
+  // Anthropic-shaped image parts (not OpenAI image_url).
   // contentHasAttachments treats these as attachments — must convert or
   // the image is detected then silently dropped.
   if (type === "image") {
@@ -183,33 +215,6 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
         if (pushDataUrl(blocks, s.url)) return;
         if (isHttpUrl(s.url)) pushRemoteUrl(blocks, s.url, mediaType);
         return;
-      }
-    }
-    const image = p.image;
-    if (typeof image === "string") {
-      if (pushDataUrl(blocks, image)) return;
-      if (isHttpUrl(image)) {
-        pushRemoteUrl(blocks, image, mediaType);
-        return;
-      }
-      // Bare base64 payload
-      blocks.push({
-        type: "image",
-        source: { type: "base64", media_type: mediaType, data: image },
-      });
-      return;
-    }
-    if (image instanceof URL) {
-      const href = image.toString();
-      if (pushDataUrl(blocks, href)) return;
-      if (isHttpUrl(href)) pushRemoteUrl(blocks, href, mediaType);
-      return;
-    }
-    if (image && typeof image === "object" && "url" in image) {
-      const url = (image as { url?: unknown }).url;
-      if (typeof url === "string") {
-        if (pushDataUrl(blocks, url)) return;
-        if (isHttpUrl(url)) pushRemoteUrl(blocks, url, mediaType);
       }
     }
     return;
@@ -400,55 +405,31 @@ export function extractTextContent(content: unknown): string {
 }
 
 const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+/**
+ * A system update OpenCode lowers into user text for an OpenAI-form
+ * provider (ai/src/protocols/shared.ts wrapSystemUpdate): appended to the
+ * previous user message's text, or a user message of its own.
+ */
+const SYSTEM_UPDATE_BLOCK = /<system-update>[\s\S]*?<\/system-update>/g;
 
 /**
- * One short hash per user message of a conversation, in order: the
- * conversation's shape as far as revert/edit detection needs it.
- *
- * Only user messages count. OpenCode may re-serialize assistant output
- * (steps split per tool call, reasoning dropped), but a user message is
- * sent the same way every time. Two kinds are skipped, because they are
- * not stable across requests: OpenCode's promoted tool media, and
- * <system-reminder> messages. Plan mode splices its reminder in before the
- * user's prompt when sending, but stores it after, so its position moves
- * between requests. Reminder blocks inside other messages are dropped too.
- * Attachments count by presence only; their encoding may change.
+ * The user's own text of a message: without <system-reminder> blocks and
+ * the <system-update> blocks OpenCode appends, with collapsed whitespace.
+ * Empty for a message made of reminders or updates alone.
  */
-export function userHistoryFingerprints(
-  messages: Array<{ role?: string; content?: unknown }>,
-): string[] {
-  return fingerprintedUserMessages(messages).map((entry) => entry.print);
+export function userTextIdentity(text: string): string {
+  return text.replace(SYSTEM_REMINDER_BLOCK, " ").replace(SYSTEM_UPDATE_BLOCK, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
- * The part of a history after its first `count` fingerprinted user
- * messages, starting at the next one: what came after a turn boundary of
- * `count` user messages. Empty when the history holds no more than that.
+ * Whether a user message starts a turn of its own: it has the user's own
+ * text or an attachment. A message of <system-reminder> blocks alone (Plan
+ * mode stores its reminder after the prompt it was sent before) belongs to
+ * the turn it sits in.
  */
-export function historyAfterUserCount<T extends { role?: string; content?: unknown }>(
-  messages: T[],
-  count: number,
-): T[] {
-  const next = fingerprintedUserMessages(messages)[count];
-  return next ? messages.slice(next.index) : [];
-}
-
-function fingerprintedUserMessages(
-  messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ index: number; print: string }> {
-  const entries: Array<{ index: number; print: string }> = [];
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
-    const text = extractTextContent(msg.content)
-      .replace(SYSTEM_REMINDER_BLOCK, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
-    if (!identity) continue;
-    entries.push({ index: i, print: createHash("sha1").update(identity).digest("hex").slice(0, 16) });
-  }
-  return entries;
+export function startsTurn(message: { role?: string; content?: unknown }): boolean {
+  if (message?.role !== "user") return false;
+  return !!userTextIdentity(extractTextContent(message.content)) || contentHasAttachments(message.content);
 }
 
 export function contentHasAttachments(content: unknown): boolean {
@@ -457,6 +438,7 @@ export function contentHasAttachments(content: unknown): boolean {
     if (!part || typeof part !== "object") return false;
     const type = (part as { type?: unknown }).type;
     return (
+      type === "media" ||
       type === "image_url" ||
       type === "input_image" ||
       type === "file" ||
@@ -489,19 +471,111 @@ export type McpToolResultContent =
     };
 
 /**
- * Convert OpenAI-compatible tool result content into MCP result blocks.
- * OpenCode's read tool returns images and PDFs as file attachments on the
- * tool result; those must stay attached when the parked Claude SDK tool call
- * resumes. Base64 documents travel as MCP embedded `resource` blobs (Claude
- * Code saves them to disk and hands the model the path); URL-sourced media
- * cannot ride in an MCP result, so the model gets the URL as text instead of
- * a silent drop.
+ * Media of a list part (OpenCode's Media.Asset: `source` base64, bytes or
+ * url, and `mediaType`) as a content block. Text files never get here: the
+ * list carries them as text parts.
  */
-export function openaiToolResultToMcpContent(
-  content: unknown,
-): McpToolResultContent[] {
+function pushMedia(blocks: AnthropicContentBlock[], media: unknown): void {
+  if (!media || typeof media !== "object") return;
+  const m = media as { source?: Record<string, unknown>; mediaType?: unknown };
+  const source = m.source ?? {};
+  const mediaType = String(m.mediaType ?? source.mediaType ?? "application/octet-stream").toLowerCase();
+  if (source.type === "base64" && typeof source.data === "string") {
+    pushDataUrl(blocks, `data:${mediaType};base64,${source.data}`);
+    return;
+  }
+  if (source.type === "bytes" && source.data instanceof Uint8Array) {
+    pushDataUrl(blocks, `data:${mediaType};base64,${Buffer.from(source.data).toString("base64")}`);
+    return;
+  }
+  if (source.type === "url" && typeof source.url === "string") {
+    if (pushDataUrl(blocks, source.url)) return;
+    if (isHttpUrl(source.url)) pushRemoteUrl(blocks, source.url, mediaType);
+  }
+}
+
+/** A file a tool returned (Tool.FileContent): a data URL, an http(s) URL, or bare base64 in `uri`. */
+function pushToolFile(blocks: AnthropicContentBlock[], file: Record<string, unknown>): void {
+  const uri = typeof file.uri === "string" ? file.uri : "";
+  const mime = typeof file.mime === "string" ? file.mime : "application/octet-stream";
+  if (!uri) return;
+  if (/^data:/i.test(uri)) {
+    const parsed = parseDataUrl(uri);
+    if (parsed) pushDataUrl(blocks, `data:${mime};base64,${parsed.data}`);
+    return;
+  }
+  if (isHttpUrl(uri)) {
+    pushRemoteUrl(blocks, uri, mime);
+    return;
+  }
+  pushDataUrl(blocks, `data:${mime};base64,${uri}`);
+}
+
+/** The content of a list message as Claude content blocks: its text and its media. */
+export function listContentToBlocks(content: unknown): AnthropicContentBlock[] {
+  if (typeof content === "string") {
+    const text = content.trim();
+    return text ? [{ type: "text", text }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+  const blocks: AnthropicContentBlock[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as ListPart;
+    if (p.type === "text" && typeof p.text === "string") pushText(blocks, p.text);
+    else if (p.type === "media") pushMedia(blocks, p.media);
+  }
+  return blocks;
+}
+
+/** The text of a tool result the way OpenCode sends it (protocols/shared.ts toolResultText). */
+function toolResultText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const r = result as { type?: unknown; value?: unknown };
+  if (r.type === "text") return String(r.value ?? "");
+  if (r.type === "content" && Array.isArray(r.value)) {
+    return r.value
+      .filter((item) => (item as { type?: unknown } | null)?.type === "text")
+      .map((item) => String((item as { text?: unknown }).text ?? ""))
+      .join("\n");
+  }
+  if (typeof r.value === "string") return r.value;
+  try {
+    return JSON.stringify(r.value) ?? String(r.value);
+  } catch {
+    return String(r.value);
+  }
+}
+
+/** A tool result part (`tool-result`) as content blocks: its text, then the files it returned. */
+export function toolResultToBlocks(part: ListPart): AnthropicContentBlock[] {
+  const blocks: AnthropicContentBlock[] = [];
+  pushText(blocks, toolResultText(part.result));
+  const result = part.result as { type?: unknown; value?: unknown } | undefined;
+  if (result?.type === "content" && Array.isArray(result.value)) {
+    for (const item of result.value) {
+      if ((item as { type?: unknown } | null)?.type === "file") pushToolFile(blocks, item as Record<string, unknown>);
+    }
+  }
+  return blocks;
+}
+
+/** A tool result part as the content of the parked MCP call it answers. */
+export function toolResultToMcpContent(part: ListPart): McpToolResultContent[] {
+  return blocksToMcpContent(toolResultToBlocks(part));
+}
+
+/**
+ * Content blocks as MCP result blocks. OpenCode's read tool returns images
+ * and PDFs as files on the tool result; those must stay attached when the
+ * parked Claude SDK tool call resumes. Base64 documents travel as MCP
+ * embedded `resource` blobs (Claude Code saves them to disk and hands the
+ * model the path); URL-sourced media cannot ride in an MCP result, so the
+ * model gets the URL as text instead of a silent drop.
+ */
+export function blocksToMcpContent(blocks: AnthropicContentBlock[]): McpToolResultContent[] {
   const result: McpToolResultContent[] = [];
-  for (const block of openaiContentToAnthropicBlocks(content)) {
+  for (const block of blocks) {
     if (block.type === "text") {
       result.push(block);
       continue;
@@ -585,30 +659,23 @@ const UNRELAYABLE_USER_MESSAGE =
   "[The user's latest message contained an attachment that could not be relayed to Claude (unsupported format or location). Tell the user it could not be read.]";
 
 /**
- * Indices of the latest user turn: every real user message after the last
+ * Indices of the latest user turn: every user message after the last
  * assistant message, in order. OpenCode queues messages the user sends while
  * no turn runs for them; they arrive together and all await one answer.
- * OpenCode's synthetic "Attached media from tool result:" messages are tool
- * output, not user turns, and are skipped. When the step after the last
- * assistant message holds only tool output, the newest real user message
- * stands in — never an older one, which would make Claude redo an answered
- * request. Empty without any real user message.
+ * When the step after the last assistant message holds only tool output,
+ * the newest user message stands in — never an older one, which would make
+ * Claude redo an answered request. Empty without any user message.
  */
-function latestUserTurn(
-  messages: Array<{ role?: string; content?: unknown }>,
-): number[] {
+export function latestUserTurn(messages: readonly ConversationMessage[]): number[] {
   const turn: number[] = [];
-  // An assistant message was passed before any real user message.
+  // An assistant message was passed before any user message.
   let toolStep = false;
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role === "assistant") {
       if (turn.length > 0) break;
       toolStep = true;
-    } else if (
-      msg?.role === "user" &&
-      !isSyntheticToolMediaMessage(msg, messages[i - 1])
-    ) {
+    } else if (msg?.role === "user") {
       turn.unshift(i);
       if (toolStep) break;
     }
@@ -622,9 +689,9 @@ function latestUserTurn(
  * a `file://` image), says so instead of going silent; a truly empty
  * message yields "".
  */
-function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
+export function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
   const blocks = contentHasAttachments(content)
-    ? openaiContentToAnthropicBlocks(content)
+    ? listContentToBlocks(content)
     : [];
   if (blocks.length > 0) return blocks;
   const text = extractTextContent(content).trim();
@@ -644,12 +711,15 @@ function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
 /**
  * Latest user turn (see `latestUserTurn`) as a Claude Agent SDK prompt,
  * string when text-only. Queued messages are combined in order: texts are
- * separated by a blank line, attachments keep their position.
+ * separated by a blank line, attachments keep their position. `after`: the
+ * messages up to that index are in the transcript already and are left out.
  */
 export function latestUserPrompt(
-  messages: Array<{ role?: string; content?: unknown }>,
+  messages: readonly ConversationMessage[],
+  after = -1,
 ): string | SdkUserPrompt {
   const parts = latestUserTurn(messages)
+    .filter((i) => i > after)
     .map((i) => userMessagePrompt(messages[i]!.content))
     .filter((part) => part.length > 0);
   if (parts.every((part) => typeof part === "string")) {
@@ -674,111 +744,78 @@ export function latestUserPrompt(
  * OpenCode then treats them as answered). Returns the content of the real
  * user messages after the last tool result; empty when there are none.
  */
-export function collectSteering(
-  messages: Array<{ role?: string; content?: unknown }>,
-): McpToolResultContent[] {
+export function collectSteering(messages: readonly ConversationMessage[]): McpToolResultContent[] {
   return collectSteeringMessages(messages).flatMap((m) => m.blocks);
 }
 
 /**
- * Steering messages one by one, each with a `key` that identifies it across
- * resume requests: its content plus how many earlier user messages carry the
- * same content. A raw index would not do, because tool results of a split
- * park get inserted before the queued message in later requests.
+ * Steering messages one by one. `id` is the OpenCode id the message is
+ * named after (the original's, kept in its metadata, for a fork's copy);
+ * `key` tells the message apart across resume requests: its id, or, for a
+ * message without one, its content plus how many earlier user messages
+ * carry the same content.
  */
-export function collectSteeringMessages(
-  messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> {
+export function collectSteeringMessages(messages: readonly ConversationMessage[]): Array<{
+  key: string;
+  id?: string;
+  blocks: McpToolResultContent[];
+  prompt: string | AnthropicContentBlock[];
+}> {
   let lastTool = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.role === "tool") lastTool = i;
   }
   if (lastTool < 0) return [];
-  const out: Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> = [];
+  const out: ReturnType<typeof collectSteeringMessages> = [];
   const occurrences = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
+    const msg = messages[i]!;
+    if (msg.role !== "user") continue;
     const identity = JSON.stringify(msg.content ?? null);
     const nth = occurrences.get(identity) ?? 0;
     occurrences.set(identity, nth + 1);
     if (i <= lastTool) continue;
-    const content = openaiToolResultToMcpContent(msg.content);
+    const content = blocksToMcpContent(listContentToBlocks(msg.content));
     const hasText = content.some((b) => b.type === "text" && b.text.trim());
-    if (hasText || content.some((b) => b.type !== "text")) {
-      out.push({ key: `${nth}:${identity}`, blocks: content, prompt: userMessagePrompt(msg.content) });
-    }
+    if (!hasText && !content.some((b) => b.type !== "text")) continue;
+    const original = msg.metadata?.[ORIGINAL_ID_KEY];
+    const id = typeof original === "string" && original ? original : msg.id;
+    out.push({ key: id ? `id:${id}` : `${nth}:${identity}`, id, blocks: content, prompt: userMessagePrompt(msg.content) });
   }
   return out;
 }
 
-function isSystemUpdate(text: string): boolean {
-  return text.startsWith("<system-update>") && text.endsWith("</system-update>");
+/** The parts of a message of one type. */
+function partsOf(message: ConversationMessage | undefined, type: string): ListPart[] {
+  return Array.isArray(message?.content) ? message.content.filter((part) => part?.type === type) : [];
 }
 
-/** Append steering to a tool result so Claude reads it on resume. */
-export function withSteering(
-  result: McpToolResultContent[],
-  steering: McpToolResultContent[],
-): McpToolResultContent[] {
-  if (steering.length === 0) return result;
-  const texts = steering
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text.trim())
-    .filter(Boolean);
-  // OpenCode sends a changed session context entry as `<system-update>` user
-  // text. It comes from the host, not the user, so it is not labelled as theirs.
-  const updates = texts.filter(isSystemUpdate);
-  const text = texts.filter((t) => !isSystemUpdate(t)).join("\n\n");
-  const media = steering.filter((b) => b.type !== "text");
-  const userSent = text.length > 0 || media.length > 0;
-  return [
-    ...result,
-    ...(updates.length > 0
-      ? [{ type: "text" as const, text: updates.join("\n\n") }]
-      : []),
-    ...(userSent
-      ? [
-          {
-            type: "text" as const,
-            text: [
-              "<system-reminder>",
-              "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
-              "",
-              text || "(attachments only, see below)",
-              "</system-reminder>",
-            ].join("\n"),
-          },
-        ]
-      : []),
-    ...media,
-  ];
+/** The tool results of a request: tool call id → the results as MCP content. */
+export function collectToolResults(messages: readonly ConversationMessage[]): Map<string, McpToolResultContent[]> {
+  const results = new Map<string, McpToolResultContent[]>();
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    for (const part of partsOf(message, "tool-result")) {
+      if (typeof part.id === "string") results.set(part.id, toolResultToMcpContent(part));
+    }
+  }
+  return results;
 }
-
-type ToolStepMessage = {
-  role?: string;
-  content?: unknown;
-  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
-  tool_call_id?: string;
-  name?: string;
-};
 
 /**
  * Index of the last assistant message when it called tools and at least one
  * of those calls has its result after it: a tool step OpenCode answered.
  * Null when the last assistant message is a plain reply (a normal new turn).
  */
-export function answeredToolStepIndex(messages: ToolStepMessage[]): number | null {
+export function answeredToolStepIndex(messages: readonly ConversationMessage[]): number | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
-    const ids = new Set(
-      (msg.tool_calls ?? []).map((call) => call?.id).filter(Boolean),
-    );
+    const ids = new Set(partsOf(msg, "tool-call").map((call) => call.id).filter(Boolean));
     if (ids.size === 0) return null;
     const answered = messages
       .slice(i + 1)
-      .some((m) => m?.role === "tool" && !!m.tool_call_id && ids.has(m.tool_call_id));
+      .some((m) => m.role === "tool" && partsOf(m, "tool-result").some((part) => ids.has(part.id)));
     return answered ? i : null;
   }
   return null;
@@ -792,7 +829,7 @@ export function answeredToolStepIndex(messages: ToolStepMessage[]): number | nul
  * results with media, and any user messages sent after them.
  */
 export function answeredToolStepPrompt(
-  messages: ToolStepMessage[],
+  messages: readonly ConversationMessage[],
   assistantIndex: number,
   options: { otherModel?: boolean } = {},
 ): SdkUserPrompt {
@@ -831,7 +868,7 @@ const HOST_STOP_NOTE =
  * result and media. User messages sent after the calls come separately.
  */
 function toolStepBlocks(
-  messages: ToolStepMessage[],
+  messages: readonly ConversationMessage[],
   assistantIndex: number,
 ): { blocks: AnthropicContentBlock[]; userBlocks: AnthropicContentBlock[] } {
   const assistant = messages[assistantIndex]!;
@@ -840,39 +877,116 @@ function toolStepBlocks(
   if (stepText) {
     blocks.push({ type: "text", text: `Your message in that step:\n${stepText}` });
   }
-  const calls = new Map(
-    (assistant.tool_calls ?? []).map((call) => [call?.id, call?.function]),
-  );
+  const calls = new Map(partsOf(assistant, "tool-call").map((call) => [call.id, call]));
   const userBlocks: AnthropicContentBlock[] = [];
-  const stepMessages = messages.slice(assistantIndex + 1);
-  for (const [index, msg] of stepMessages.entries()) {
-    if (msg?.role === "tool" && msg.tool_call_id) {
-      const call = calls.get(msg.tool_call_id);
-      const result = openaiContentToAnthropicBlocks(decodeToolMessageContent(msg.content));
-      blocks.push(
-        {
-          type: "text",
-          text: `Result of ${call?.name ?? msg.name ?? "tool"} ${call?.arguments ?? ""} (${msg.tool_call_id}):`,
-        },
-        ...(result.length > 0 ? result : [{ type: "text" as const, text: "(no output)" }]),
-      );
-    } else if (msg && isSyntheticToolMediaMessage(msg, stepMessages[index - 1] ?? messages[assistantIndex])) {
-      blocks.push(
-        { type: "text", text: "Media attached to these tool results:" },
-        ...openaiContentToAnthropicBlocks(msg.content).filter(
-          (b) => !(b.type === "text" && b.text.trim() === SYNTHETIC_TOOL_MEDIA_PROMPT),
-        ),
-      );
-    } else if (msg?.role === "user") {
-      userBlocks.push(...openaiContentToAnthropicBlocks(msg.content));
+  for (const msg of messages.slice(assistantIndex + 1)) {
+    if (msg.role === "tool") {
+      for (const part of partsOf(msg, "tool-result")) {
+        const call = calls.get(part.id);
+        const result = toolResultToBlocks(part);
+        blocks.push(
+          {
+            type: "text",
+            text: `Result of ${call?.name ?? part.name ?? "tool"} ${JSON.stringify(call?.input ?? {})} (${part.id}):`,
+          },
+          ...(result.length > 0 ? result : [{ type: "text" as const, text: "(no output)" }]),
+        );
+      }
+    } else if (msg.role === "user") {
+      userBlocks.push(...listContentToBlocks(msg.content));
     }
   }
   return { blocks, userBlocks };
 }
 
+/** A line of a missed message's record, or the content blocks of a file it holds. */
+export type MissedLine = string | AnthropicContentBlock[];
+
+/**
+ * A message the transcript never saw, as the lines of its record: each part
+ * on a line of its own, labelled the way OpenCode labels messages when it
+ * turns them into text itself (compaction.ts `flattenMessage`), so Claude
+ * reads who said what without being told which model it was. The labels are
+ * OpenCode's, not ours: [User], [Assistant], [Assistant tool call],
+ * [Tool result], [Tool error], and [Attached <media type>: <name>] for a
+ * file. Unlike OpenCode, which turns them into text only when it compacts,
+ * nothing is cut: tool output goes whole, and an image or a document (the
+ * user's or one a tool returned) follows its label as itself, since the
+ * other model saw it (OpenCode's list always carries a file's data). Reasoning
+ * is left out, as OpenCode does.
+ */
+export function missedMessageContent(message: ConversationMessage): MissedLine[] {
+  if (message.role === "system") return [];
+  const speaker = message.role === "user" ? "User" : "Assistant";
+  const lines: MissedLine[] = [];
+  for (const part of message.content ?? []) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text") {
+      if (part.text) lines.push(`[${speaker}]: ${part.text}`);
+      continue;
+    }
+    if (part.type === "media") {
+      const media = part.media as { mediaType?: unknown; source?: { mediaType?: unknown } } | undefined;
+      const mediaType = String(media?.mediaType ?? media?.source?.mediaType ?? "file");
+      const blocks = listContentToBlocks([part]);
+      const name = typeof part.filename === "string" ? `: ${part.filename}` : "";
+      lines.push(`[${speaker}]: [Attached ${mediaType}${name}]`);
+      if (blocks.length > 0) lines.push(blocks);
+      continue;
+    }
+    if (part.type === "tool-call") {
+      lines.push(`[Assistant tool call]: ${part.name}(${JSON.stringify(part.input) ?? ""})`);
+      continue;
+    }
+    if (part.type === "tool-result") {
+      const result = part.result as { type?: unknown; value?: unknown } | undefined;
+      const failed = part.resultType === "error" || result?.type === "error";
+      lines.push(`[${failed ? "Tool error" : "Tool result"}]: ${toolResultLine(result)}`);
+      const files = toolResultToBlocks(part).filter((block) => block.type !== "text");
+      if (files.length > 0) lines.push(files);
+    }
+  }
+  return lines;
+}
+
+/** A tool result as OpenCode writes it in text: its texts, and a note per file (serializeToolContent). */
+function toolResultLine(result: { type?: unknown; value?: unknown } | undefined): string {
+  if (!result) return "";
+  if (result.type === "content" && Array.isArray(result.value)) {
+    return result.value
+      .map((item) => {
+        const i = item as { type?: unknown; text?: unknown; mime?: unknown; name?: unknown };
+        if (i?.type === "text") return String(i.text ?? "");
+        return `[Attached ${String(i?.mime ?? "file")}${typeof i?.name === "string" ? `: ${i.name}` : ""}]`;
+      })
+      .join("\n");
+  }
+  if (typeof result.value === "string") return result.value;
+  return JSON.stringify(result.value) ?? "";
+}
+
+/** A record of the prompt: its content, its uuid, and whether it starts the turn. */
+export function promptRecord(
+  content: string | AnthropicContentBlock[],
+  uuid: string | undefined,
+  noTurn: boolean,
+): SdkUserPrompt {
+  return {
+    type: "user",
+    message: { role: "user", content: typeof content === "string" ? content || " " : content },
+    parent_tool_use_id: null,
+    ...(uuid ? { uuid } : {}),
+    ...(noTurn ? { shouldQuery: false as const } : {}),
+  };
+}
+
 export async function* promptAsStream(
-  prompt: string | SdkUserPrompt,
+  prompt: string | SdkUserPrompt | SdkUserPrompt[],
 ): AsyncGenerator<SdkUserPrompt, void, unknown> {
+  if (Array.isArray(prompt)) {
+    yield* prompt;
+    return;
+  }
   if (typeof prompt === "string") {
     yield {
       type: "user",
@@ -885,93 +999,6 @@ export async function* promptAsStream(
 }
 
 /**
- * Conversation-history transfer.
- *
- * The Agent SDK turn only receives the latest user turn; earlier context
- * comes from resuming the sticky Claude session. When no session can be
- * resumed (first claude-code turn after a model switch, lost store, deleted
- * session file), the proxy injects the serialized prior conversation instead
- * so Claude still sees the whole chat.
- */
-
-export type ConversationHistoryMessage = {
-  role?: string;
-  content?: unknown;
-  tool_calls?: Array<{
-    id?: string;
-    type?: string;
-    function?: { name?: string; arguments?: string };
-  }>;
-  tool_call_id?: string;
-  name?: string;
-};
-
-/** Default history budget — generous on purpose ("keep it big"). */
-const DEFAULT_HISTORY_MAX_CHARS = 400_000;
-const TOOL_RESULT_MAX_CHARS = 1_000;
-const ATTACHMENT_NOTE = "[attachment(s) omitted from transferred history]";
-
-export function historyMaxChars(): number {
-  const raw = process.env.OPENCODE_CLAUDE_HISTORY_MAX_CHARS;
-  const parsed = raw ? Number(raw) : NaN;
-  return Number.isInteger(parsed) && parsed >= 0
-    ? parsed
-    : DEFAULT_HISTORY_MAX_CHARS;
-}
-
-function truncateMiddle(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const head = text.slice(0, Math.floor(max / 2));
-  const tail = text.slice(text.length - Math.floor(max / 2));
-  return `${head}\n… [${text.length - max} chars omitted] …\n${tail}`;
-}
-
-function serializeHistoryMessage(
-  msg: ConversationHistoryMessage,
-  toolNames: ReadonlyMap<string, string>,
-): string | null {
-  if (!msg || typeof msg !== "object") return null;
-  const role = msg.role;
-  // System prompts are OpenCode-internal and huge; the Claude Code preset
-  // supplies the agent system prompt instead.
-  if (role === "system") return null;
-
-  if (role === "user") {
-    const text = extractTextContent(msg.content).trim();
-    const hasAttach = contentHasAttachments(msg.content);
-    if (!text && !hasAttach) return null;
-    return `User:\n${text}${hasAttach ? `\n${ATTACHMENT_NOTE}` : ""}`.trim();
-  }
-
-  if (role === "assistant") {
-    const parts: string[] = [];
-    const text = extractTextContent(msg.content).trim();
-    if (text) parts.push(text);
-    for (const call of msg.tool_calls ?? []) {
-      const name = call?.function?.name;
-      if (name) parts.push(`[called tool: ${name}]`);
-    }
-    if (parts.length === 0) return null;
-    return `Assistant:\n${parts.join("\n")}`;
-  }
-
-  if (role === "tool") {
-    const text = extractTextContent(decodeToolMessageContent(msg.content)).trim();
-    if (!text) return null;
-    // OpenAI-style tool messages carry only tool_call_id; the name is on the
-    // assistant's call.
-    const label =
-      (typeof msg.name === "string" && msg.name) ||
-      (typeof msg.tool_call_id === "string" &&
-        (toolNames.get(msg.tool_call_id) || msg.tool_call_id)) ||
-      "tool";
-    return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
-  }
-
-  return null;
-}
-
-/**
  * Messages before the latest user turn — the context Claude is missing. Ends
  * before the FIRST message of that turn: queued messages travel in the
  * prompt and must not repeat in the transcript.
@@ -981,96 +1008,12 @@ function serializeHistoryMessage(
  * in neither transcript nor prompt. The prompt only repeats the user message,
  * so the transcript keeps everything in order, that message included.
  */
-export function priorMessagesOf(
-  messages: ConversationHistoryMessage[],
-): ConversationHistoryMessage[] {
+export function priorMessagesOf(messages: readonly ConversationMessage[]): ConversationMessage[] {
   const start = latestUserTurn(messages)[0] ?? 0;
   const answeredAfter = messages
     .slice(start + 1)
     .some((m) => m?.role === "assistant" || m?.role === "tool");
   return answeredAfter ? messages.slice() : messages.slice(0, start);
-}
-
-/**
- * Serialize prior conversation into a compact transcript, keeping the NEWEST
- * messages within the char budget (older turns are dropped first).
- */
-export function buildConversationTranscript(
-  messages: ConversationHistoryMessage[],
-  maxChars: number = historyMaxChars(),
-): string {
-  if (maxChars <= 0) return "";
-  const toolNames = new Map<string, string>();
-  for (const msg of messages) {
-    for (const call of msg?.tool_calls ?? []) {
-      if (call?.id && call.function?.name) toolNames.set(call.id, call.function.name);
-    }
-  }
-  const serialized: string[] = [];
-  for (const msg of messages) {
-    const line = serializeHistoryMessage(msg, toolNames);
-    if (line) serialized.push(line);
-  }
-  if (serialized.length === 0) return "";
-
-  const kept: string[] = [];
-  let total = 0;
-  let omitted = 0;
-  for (let i = serialized.length - 1; i >= 0; i--) {
-    const entry = serialized[i];
-    if (total + entry.length > maxChars) {
-      omitted = i + 1;
-      break;
-    }
-    kept.unshift(entry);
-    total += entry.length;
-  }
-  const header = omitted > 0 ? `[${omitted} earlier message(s) omitted]\n\n` : "";
-  return header + kept.join("\n\n");
-}
-
-/**
- * Prepend a transferred-history block to a prompt. Text prompts get a plain
- * prefix; multimodal prompts get an extra leading text block so attachments
- * still reach Claude.
- *
- * `missed` marks a transcript of only the turns a resumed session never saw
- * (another model answered them, or they failed before Claude ran).
- */
-export function withConversationContext(
-  prompt: string | SdkUserPrompt,
-  transcript: string,
-  missed = false,
-): string | SdkUserPrompt {
-  const body = transcript.trim();
-  if (!body) return prompt;
-  const intro = missed
-    ? "These messages were added to this chat after your last turn, without you " +
-      "(for example, the user switched to another model for them). Treat them as part " +
-      "of the conversation — do not re-do completed work — and respond to the user's " +
-      "latest message, which follows them.\n\n"
-    : "The earlier conversation of this chat is included below because the previous " +
-      "Claude session could not be resumed. Treat it as established context — do not " +
-      "re-do completed work — and respond to the user's latest message, which follows " +
-      "the history.\n\n";
-  const prefix =
-    "<conversation_history>\n" +
-    intro +
-    body +
-    "\n</conversation_history>\n\nLatest user message:\n";
-  if (typeof prompt === "string") {
-    return prefix + prompt;
-  }
-  const content = Array.isArray(prompt.message.content)
-    ? prompt.message.content
-    : [];
-  return {
-    ...prompt,
-    message: {
-      role: "user",
-      content: [{ type: "text", text: prefix }, ...content],
-    },
-  };
 }
 
 /** Put a text block ahead of the prompt, keeping any image/PDF blocks. */
@@ -1106,15 +1049,19 @@ export function buildRuntimeInstructions(): string {
  */
 export type TurnInput = {
   stream: AsyncGenerator<SdkUserPrompt, void, unknown>;
-  /** Resolves once the SDK has taken the message for the CLI. */
-  push(content: string | AnthropicContentBlock[]): Promise<void>;
+  /**
+   * Resolves once the SDK has taken the message for the CLI. `uuid` names
+   * the message's record in the transcript (names.ts): the CLI keeps it as
+   * the `source_uuid` of the attachment it absorbs the message into.
+   */
+  push(content: string | AnthropicContentBlock[], uuid?: string): Promise<void>;
   end(): void;
   ended(): boolean;
 };
 
 const TURN_INPUT_TAKE_MS = 2000;
 
-export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
+export function createTurnInput(first: string | SdkUserPrompt | SdkUserPrompt[]): TurnInput {
   type Entry = { prompt: SdkUserPrompt; taken: () => void };
   const queue: Entry[] = [];
   let wake: (() => void) | null = null;
@@ -1123,13 +1070,18 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
     wake?.();
     wake = null;
   };
-  const firstPrompt: SdkUserPrompt =
-    typeof first === "string"
-      ? { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null }
-      : first;
+  // The records the turn starts with: those without a turn first, then the
+  // one that starts it.
+  const firstPrompts: SdkUserPrompt[] = Array.isArray(first)
+    ? first
+    : [
+        typeof first === "string"
+          ? { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null }
+          : first,
+      ];
   async function* stream(): AsyncGenerator<SdkUserPrompt, void, unknown> {
     try {
-      yield firstPrompt;
+      yield* firstPrompts;
       while (!done) {
         const entry = queue.shift();
         if (entry) {
@@ -1146,7 +1098,7 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
   }
   return {
     stream: stream(),
-    push(content) {
+    push(content, uuid) {
       if (done) return Promise.resolve();
       // A CLI that stops reading must not hold the tool results back.
       return new Promise<void>((resolve) => {
@@ -1162,6 +1114,7 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
             message: { role: "user", content },
             parent_tool_use_id: null,
             priority: "next",
+            ...(uuid ? { uuid } : {}),
           } as SdkUserPrompt,
           taken,
         });
@@ -1173,5 +1126,103 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
       notify();
     },
     ended: () => done,
+  };
+}
+
+/**
+ * The prompt of a turn that starts a new transcript, after the record the
+ * transcript starts with: blank, without a turn, named `uuid`
+ * (names.ts TRANSCRIPT_START_NAME). It gives the chat's first message a
+ * record to resume at: a retry of a first message that failed resumes there
+ * in the same transcript, where it would otherwise need a new one (the CLI
+ * starts no transcript without a record, and refuses a name in use). The
+ * CLI sends the model nothing of a blank text (probe 47: an empty string
+ * would reach it as "(no content)", an empty array writes no record).
+ */
+export async function* withTranscriptStart(
+  prompt: string | AsyncIterable<SdkUserPrompt>,
+  uuid: string,
+): AsyncGenerator<SdkUserPrompt, void, unknown> {
+  yield { type: "user", message: { role: "user", content: " " }, parent_tool_use_id: null, uuid, shouldQuery: false };
+  yield* typeof prompt === "string" ? promptAsStream(prompt) : prompt;
+}
+
+/**
+ * How long a record without a turn waits for the CLI to confirm the one
+ * before it; then it goes anyway. The CLI confirms in about 10 ms (up to
+ * about 400 ms as it starts), and records sent 300 ms apart or more were
+ * never joined (Claude Code 2.1.311).
+ */
+const RECORD_WRITTEN_WAIT_MS = 1000;
+
+/** A turn's input that hands the CLI its records so that each keeps its name. */
+export type RecordsOneByOne = {
+  stream: AsyncGenerator<SdkUserPrompt, void, unknown>;
+  /**
+   * Every event of the turn's stream: an empty result (`num_turns: 0`)
+   * confirms the record without a turn named in its `user_message_uuid`.
+   */
+  observe(event: unknown): void;
+};
+
+/**
+ * Hand the CLI a turn's records so that each keeps its own name. The CLI
+ * takes everything waiting in its input at once and joins consecutive
+ * records without a turn (`shouldQuery: false`) into one record, under the
+ * last one's uuid: the names of the others are lost (how many it joins
+ * depends on timing; test/cli-contract-live.ts, check 5.1). It answers every
+ * record without a turn it wrote with an empty result that names the record
+ * (`user_message_uuid`), so a record without a turn that follows another
+ * goes only after the result naming that one. A record that starts a turn is
+ * never joined and does not wait; neither does a message sent mid-turn.
+ * Without the confirmation (the CLI dropped the record as a repeated uuid, or
+ * a CLI that no longer answers) the record goes after RECORD_WRITTEN_WAIT_MS;
+ * a lost name then costs only the cut between the joined records: the lookup
+ * by names goes back to the last one it finds (turn-point.ts planResume).
+ */
+export function recordsOneByOne(
+  prompt: AsyncIterable<SdkUserPrompt>,
+  waitMs = RECORD_WRITTEN_WAIT_MS,
+): RecordsOneByOne {
+  /** The records without a turn the CLI confirmed, by uuid. */
+  const written = new Set<string>();
+  let wake: (() => void) | null = null;
+  const confirmed = async (uuid: string) => {
+    const deadline = Date.now() + waitMs;
+    while (!written.has(uuid)) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        log.warn("[opencode-claude] Claude Code did not confirm a record without a turn; sending the next one", { waitMs });
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, left);
+        timer.unref?.();
+        wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      wake = null;
+    }
+  };
+  async function* stream(): AsyncGenerator<SdkUserPrompt, void, unknown> {
+    let previous: SdkUserPrompt | undefined;
+    for await (const record of prompt) {
+      if (record.shouldQuery === false && previous?.shouldQuery === false && previous.uuid) await confirmed(previous.uuid);
+      previous = record;
+      yield record;
+    }
+  }
+  return {
+    stream: stream(),
+    observe(event) {
+      // Claude Code (2.1.300 and later) names the record in every such
+      // result (the 2.1.300 probe).
+      const e = event as { type?: unknown; num_turns?: unknown; is_error?: unknown; user_message_uuid?: string } | null;
+      if (e?.type !== "result" || e.num_turns !== 0 || e.is_error === true) return;
+      written.add(e.user_message_uuid!);
+      wake?.();
+    },
   };
 }
